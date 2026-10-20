@@ -86,6 +86,23 @@ data "aws_iam_policy_document" "api_task" {
       values   = ["results/*"]
     }
   }
+
+  statement {
+    # SendMessage to an SSE-KMS queue requires envelope-key generation.
+    sid       = "SqsQueueKeyGenerateDataKey"
+    effect    = "Allow"
+    actions   = ["kms:GenerateDataKey*"]
+    resources = [aws_kms_key.sqs.arn]
+  }
+
+  statement {
+    # Reading (including presigned GETs of) SSE-KMS result objects needs the
+    # data-key plaintext, i.e. decrypt on the results key.
+    sid       = "S3ResultsKeyDecrypt"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = [aws_kms_key.results.arn]
+  }
 }
 
 resource "aws_iam_role" "api_task" {
@@ -194,6 +211,30 @@ data "aws_iam_policy_document" "worker_lambda" {
       "sqs:ChangeMessageVisibility",
     ]
     resources = [aws_sqs_queue.jobs.arn]
+  }
+
+  statement {
+    # Decrypt for received messages; GenerateDataKey* also covers redrive
+    # SendMessage into the encrypted DLQ.
+    sid    = "SqsQueueKeyUse"
+    effect = "Allow"
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey*",
+    ]
+    resources = [aws_kms_key.sqs.arn]
+  }
+
+  statement {
+    # PutObject under SSE-KMS needs envelope-key generation; presigned GETs
+    # authorize against these same permissions.
+    sid    = "S3ResultsKeyUse"
+    effect = "Allow"
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey*",
+    ]
+    resources = [aws_kms_key.results.arn]
   }
 
   statement {

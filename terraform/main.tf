@@ -127,6 +127,9 @@ resource "aws_cloudwatch_log_group" "worker" {
 # Application Load Balancer (internet-facing, public subnets)
 # --------------------------------------------------------------------------------------
 
+# trivy:ignore:AWS-0053 — Quac is a *public* MaaS API: the internet-facing ALB
+# is the product surface, fronted by an ACM certificate with an ALB TLS 1.3
+# security policy. Exposure is intentional, not accidental.
 resource "aws_lb" "api" {
   name               = "${var.project}-${var.environment}-api"
   internal           = false
@@ -185,8 +188,12 @@ resource "aws_security_group" "fargate" {
     security_groups = [aws_security_group.alb.id]
   }
 
+  # trivy:ignore:AWS-0104 — egress is already narrowed to tcp/443 only; the
+  # 0.0.0.0/0 destination is required because Fargate tasks reach DynamoDB,
+  # SQS, KMS and CloudWatch through a NAT gateway (no VPC interface endpoints
+  # in this workspace). Restricting further requires VPC endpoints + gateway.
   egress {
-    description = "HTTPS out (DynamoDB/SQS endpoints, AWS APIs via NAT)"
+    description = "HTTPS out (DynamoDB/SQS/KMS endpoints, AWS APIs via NAT)"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"

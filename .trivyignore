@@ -1,0 +1,19 @@
+# Trivy accepted-risk suppressions for the Quac workspace.
+#
+# Every entry is a deliberate, reviewed exception; each carries an inline
+# `#trivy:ignore` comment with rationale at the offending site.
+
+# terraform/main.tf — Quac is a *public* MaaS API: the internet-facing ALB is
+# the product surface, fronted by ACM + an ALB TLS 1.3 security policy.
+AWS-0053
+
+# terraform/main.tf — egress is narrowed to tcp/443 only; 0.0.0.0/0 as
+# destination is required because Fargate tasks reach DynamoDB/SQS/KMS/
+# CloudWatch through a NAT gateway (no VPC interface endpoints in this
+# workspace).
+AWS-0104
+
+# worker/Dockerfile.worker — AWS Lambda executes container images as root by
+# platform design (RIC entrypoint); isolation is the Firecracker microVM plus
+# the execution role. The Fargate API image runs non-root (uid 10001).
+DS-0002

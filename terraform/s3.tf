@@ -4,12 +4,30 @@
 # Security posture:
 #   * All four public-access blocks enabled (the bucket is never reachable
 #     anonymously, regardless of ACL or bucket-policy mistakes).
-#   * AES-256 default server-side encryption (SSE-S3) on every object.
+#   * SSE-KMS with a customer-managed key (key rotation, per-key IAM and
+#     CloudTrail audit) as the default encryption on every object.
 #   * Bucket policy denies any request not using TLS (aws:SecureTransport).
 #   * Lifecycle: STANDARD -> GLACIER_DEEP_ARCHIVE after 30 days. Results are
 #     write-once reference data; hours-long retrieval latency is acceptable
 #     for an archive tier and Deep Archive is the cheapest storage class.
 # =============================================================================
+
+# Customer-managed KMS key for result-object encryption.
+resource "aws_kms_key" "results" {
+  description             = "${var.project} ${var.environment} — S3 result-object SSE"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+
+  tags = merge(var.common_tags, {
+    Name = "${var.project}-${var.environment}-results"
+    Role = "result-encryption"
+  })
+}
+
+resource "aws_kms_alias" "results" {
+  name          = "alias/${var.project}-${var.environment}-results"
+  target_key_id = aws_kms_key.results.key_id
+}
 
 resource "aws_s3_bucket" "results" {
   bucket        = "${var.project}-${var.environment}-results-${data.aws_caller_identity.current.account_id}"
@@ -35,9 +53,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "results" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256" # AES-256 (SSE-S3) default encryption at rest
+      sse_algorithm     = "aws:kms" # SSE-KMS with workspace CMK
+      kms_master_key_id = aws_kms_key.results.arn
     }
-    bucket_key_enabled = true # reduces request costs when upgrading to SSE-KMS
+    bucket_key_enabled = true # halves KMS request costs for repeated GETs
   }
 }
 

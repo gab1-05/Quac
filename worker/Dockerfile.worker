@@ -25,6 +25,10 @@
 # syntax=docker/dockerfile:1.7
 FROM public.ecr.aws/lambda/python:3.11
 
+# trivy:ignore:DS-0002 — AWS Lambda executes container images as root by
+# platform design (the RIC entrypoint requires it); the isolation boundary is
+# the Firecracker microVM sandbox plus the execution role, not an OCI USER.
+# The API image (Fargate) does run non-root (uid 10001).
 ARG TARGETARCH=amd64
 ARG PIP_NO_CACHE_DIR=1
 

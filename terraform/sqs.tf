@@ -13,12 +13,30 @@
 # 60 s buffer so an in-flight job is never redelivered while still running.
 # =============================================================================
 
+# Customer-managed KMS key for queue SSE. A CMK (rather than alias/aws/sqs)
+# enables rotation, key-level IAM segregation, and per-key CloudTrail audit.
+resource "aws_kms_key" "sqs" {
+  description             = "${var.project} ${var.environment} — SQS FIFO server-side encryption"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+
+  tags = merge(var.common_tags, {
+    Name = "${var.project}-${var.environment}-sqs"
+    Role = "queue-encryption"
+  })
+}
+
+resource "aws_kms_alias" "sqs" {
+  name          = "alias/${var.project}-${var.environment}-sqs"
+  target_key_id = aws_kms_key.sqs.key_id
+}
+
 resource "aws_sqs_queue" "dlq" {
   name                        = "${var.project}-${var.environment}-jobs-dlq.fifo"
   fifo_queue                  = true
   content_based_deduplication = true
-  message_retention_seconds   = 1209600         # 14 days for forensic replay
-  kms_master_key_id           = "alias/aws/sqs" # SSE with AWS-managed KMS key
+  message_retention_seconds   = 1209600             # 14 days for forensic replay
+  kms_master_key_id           = aws_kms_key.sqs.arn # SSE with workspace CMK
 
   tags = merge(var.common_tags, {
     Name = "${var.project}-${var.environment}-jobs-dlq.fifo"
@@ -33,7 +51,7 @@ resource "aws_sqs_queue" "jobs" {
   visibility_timeout_seconds  = var.sqs_visibility_timeout_seconds # 660 > Lambda 600
   message_retention_seconds   = var.sqs_message_retention_seconds
   receive_wait_time_seconds   = 20 # long-polling: fewer empty receives, lower cost
-  kms_master_key_id           = "alias/aws/sqs"
+  kms_master_key_id           = aws_kms_key.sqs.arn
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn

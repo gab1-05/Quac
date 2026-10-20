@@ -23,7 +23,7 @@ back to consumers through a resilient webhook framework.
                                          ▼                                           │
                      Lambda worker (container image, qiskit-aer)                    │
                        │  SIGALRM guard @ 9:30 · daemon compute thread              │
-                       ├─► S3  results/{Y}/{M}/{D}/{job_id}.json  (SSE-AES256)       │
+                       ├─► S3  results/{Y}/{M}/{D}/{job_id}.json  (SSE-KMS CMK)      │
                        └─► Webhook POST (HMAC-signed, 3× backoff + jitter)           │
                          └──────────────────────────────────────────────────────────┘
 ```
@@ -204,7 +204,8 @@ docker buildx build --platform linux/arm64 --build-arg TARGETARCH=arm64 \
 * **SQS** — FIFO with content-based deduplication *and* API-computed
   `MessageDeduplicationId`; DLQ with `maxReceiveCount = 3`; visibility timeout
   660 s > Lambda's 600 s cap; queue depth alarm on the DLQ.
-* **S3** — SSE-AES256 default encryption, all four public-access blocks,
+* **S3** — SSE-KMS with a customer-managed key (auto-rotating), all four
+  public-access blocks,
   TLS-only bucket policy, `BucketOwnerEnforced` (ACLs off), lifecycle
   `results/` → **GLACIER_DEEP_ARCHIVE after 30 days**.
 * **IAM (PoLP)** — API task role can only write *this* table / send to *this*
@@ -299,6 +300,7 @@ idempotent and mirrors the Terraform-provisioned resources exactly.
 |-------------|-----------------------------------------------------------------------|
 | `quality`   | ruff · mypy · pytest · gitleaks (against the pinned prod dependencies)|
 | `terraform` | `fmt -check` · `init -backend=false` · `validate`                     |
+| `security`  | trivy — dep CVEs, IaC/Dockerfile/compose misconfig, leaked secrets    |
 | `e2e`       | builds both images, boots the LocalStack stack, drives the full path  |
 
 The `e2e` job doubles as an image-build gate: it exercises `Dockerfile.api` and
@@ -322,7 +324,12 @@ The repo is scanned by the same chain CI and auditors use. The current baseline:
   fastapi 0.149.0 + starlette 1.9.0 + pydantic 2.13.5 — the exact stack the test
   suite runs green against.
 * **trivy** — filesystem scan for dependency CVEs, leaked secrets, and IaC /
-  Dockerfile / compose misconfigurations.
+  Dockerfile / compose misconfigurations. Locally the misconfig + secret
+  scanners run offline (currently 0 HIGH/CRITICAL); the CVE scan runs in CI
+  (`security` job) where the vulnerability DB downloads in seconds. Three
+  reviewed accepted risks are documented in `.trivyignore`: the public ALB
+  (it *is* the product surface), 443-only egress via NAT (no VPC endpoints),
+  and root execution in the Lambda image (platform design).
 
 ---
 
