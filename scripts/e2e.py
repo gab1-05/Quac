@@ -156,7 +156,7 @@ def main() -> int:
     now = datetime.now(UTC)
     for day_offset in (-1, 0, 1):
         day = now - timedelta(days=day_offset)
-        candidate = f"results/{day:%Y}/{day:%M}/{day:%d}/{job_id}.json"
+        candidate = f"results/{day:%Y}/{day:%m}/{day:%d}/{job_id}.json"
         try:
             s3.head_object(Bucket=BUCKET, Key=candidate)
             found_key = candidate
