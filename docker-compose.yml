@@ -72,6 +72,7 @@ services:
       AWS_ENDPOINT_URL_S3: http://localstack:4566
       QUAC_JOBS_TABLE: quac-jobs
       QUAC_QUEUE_URL: http://localstack:4566/000000000000/quac-jobs.fifo
+      QUAC_RESULTS_BUCKET: quac-results
       QUAC_AWS_REGION: us-east-1
       QUAC_LOG_LEVEL: INFO
       WEB_CONCURRENCY: "2"

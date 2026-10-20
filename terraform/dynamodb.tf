@@ -26,6 +26,26 @@ resource "aws_dynamodb_table" "jobs" {
     type = "S"
   }
 
+  # Owner index: tenant-scoped job listings query by owner without a table
+  # scan. Pre-auth records carry owner_id = "system" (sparse-index safe: items
+  # lacking the attribute are simply absent from the index until backfilled).
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "owner_id-index"
+    hash_key        = "owner_id"
+    range_key       = "created_at"
+    projection_type = "ALL" # jobs are small; full projection avoids follow-up reads
+  }
+
   # Point-in-time recovery: continuous backups for the last 35 days, enabling
   # restore to any second in the window — protects job state from accidental
   # DeleteItem/UpdateItem storms and software defects.

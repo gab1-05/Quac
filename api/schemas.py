@@ -76,6 +76,12 @@ class JobStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        """``True`` once the job can no longer change state."""
+        return self in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
 
 
 # --------------------------------------------------------------------------------------
@@ -159,9 +165,13 @@ class SimulationRequest(BaseModel):
         le=8192,
         description="Number of measurement shots to sample.",
     )
-    webhook_url: AnyHttpUrl = Field(
-        ...,
-        description="Strictly validated HTTP/HTTPS callback URL for result delivery.",
+    webhook_url: AnyHttpUrl | None = Field(
+        default=None,
+        description=(
+            "Optional HTTP/HTTPS callback URL for result delivery. When omitted "
+            "the job still runs; results are retrieved via "
+            "GET /v1/quantum/jobs/{job_id}/result."
+        ),
     )
     idempotency_key: str | None = Field(
         default=None,
@@ -174,8 +184,10 @@ class SimulationRequest(BaseModel):
 
     @field_validator("webhook_url")
     @classmethod
-    def _reject_credentials_in_webhook(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+    def _reject_credentials_in_webhook(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
         """Reject ``user:pass@host`` webhook URLs (credential exfiltration guard)."""
+        if value is None:
+            return None
         if value.username or value.password:
             raise ValueError("webhook_url must not embed credentials")
         if value.scheme not in ("http", "https"):
@@ -232,6 +244,86 @@ class SimulationAcceptedResponse(BaseModel):
     status: JobStatus
     status_url: str
     detail: str = "simulation accepted for asynchronous execution"
+
+
+class JobResultPayload(BaseModel):
+    """The simulation result document retrieved from private object storage.
+
+    Mirrors the JSON the worker persists under ``results/{Y}/{M}/{D}/{job_id}.json``.
+    ``statevector_probabilities`` is only inlined for small result documents;
+    the full document is always available through ``download_url``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shots: int = Field(..., description="Requested sample count.")
+    counts: dict[str, int] = Field(..., description="Measured bitstring histogram.")
+    most_frequent: str | None = Field(..., description="Outcome with the highest count.")
+    method: str = Field(..., description="Aer simulation method actually used.")
+    num_qubits: int
+    depth: int
+    simulation_time_ms: int | None = Field(
+        default=None, description="Wall-clock time the worker spent computing."
+    )
+    statevector_probabilities: dict[str, float] | None = Field(
+        default=None,
+        description="Exact |amplitude|^2 per basis state (small registers only).",
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Reproducibility details (transpile settings …)."
+    )
+
+
+class JobResultResponse(BaseModel):
+    """``GET /v1/quantum/jobs/{job_id}/result`` body."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "job_id": "3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c",
+                "status": "completed",
+                "result": {
+                    "shots": 1024,
+                    "counts": {"00": 512, "11": 512},
+                    "most_frequent": "00",
+                    "method": "matrix_product_state",
+                    "num_qubits": 2,
+                    "depth": 3,
+                    "simulation_time_ms": 842,
+                    "statevector_probabilities": None,
+                    "metadata": {},
+                },
+                "download_url": "https://…amazons3.com/…?X-Amz-Signature=…",
+                "download_expires_in_seconds": 900,
+                "error_message": None,
+            }
+        },
+    )
+
+    job_id: str
+    status: JobStatus
+    result: JobResultPayload | None = Field(
+        default=None, description="Null unless the job completed successfully."
+    )
+    download_url: str | None = Field(
+        default=None,
+        description="Short-lived pre-signed GET URL for the full result document.",
+    )
+    download_expires_in_seconds: int | None = None
+    error_message: str | None = Field(
+        default=None, description="Populated for failed jobs."
+    )
+
+
+class JobCancelResponse(BaseModel):
+    """``POST /v1/quantum/jobs/{job_id}/cancel`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: JobStatus
+    detail: str = "job cancelled; a running simulation is stopped at its next checkpoint"
 
 
 # --------------------------------------------------------------------------------------

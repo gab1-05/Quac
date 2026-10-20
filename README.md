@@ -100,6 +100,11 @@ curl -sS -X POST http://localhost:8000/v1/quantum/simulate \
   }'
 ```
 
+`webhook_url` is **optional** — omit it entirely (or send `null`) for
+polling-only consumers such as the dashboard; results are then retrieved from
+the result endpoint below. When present it must be a credential-free
+http/https URL (credentials-in-URL → `422`).
+
 `202 Accepted`:
 
 ```json
@@ -127,11 +132,41 @@ curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3
 }
 ```
 
-Status lifecycle: `queued → processing → completed | failed`.
+Status lifecycle: `queued → processing → completed | failed | cancelled`.
 
 > The tracking endpoint is protected by a **global sliding-window rate limiter**
 > (default 120 req/60 s per client IP, `429` + `Retry-After` on excess;
 > `QUAC_RATE_LIMIT_REQUESTS` / `QUAC_RATE_LIMIT_WINDOW`).
+
+### Fetch a result
+
+```bash
+curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/result
+```
+
+* `409 JOB_NOT_READY` while the job is still `queued`/`processing`;
+* `200` with `result` (shots, counts, method, depth, timings, reproducibility
+  metadata) and a short-lived **pre-signed S3 `download_url`** for the full
+  result document (TTL `QUAC_PRESIGNED_TTL`, default 900 s) once `completed`;
+* `200` with `result: null` + `error_message` for `failed`/`cancelled`;
+* `503 RESULT_UNAVAILABLE` if the artifact store cannot be read.
+
+The API reads the worker-written `results/{Y}/{M}/{D}/{job_id}.json` object
+from `QUAC_RESULTS_BUCKET` (default `quac-results`); the task role is scoped to
+`s3:GetObject` on `results/*` only.
+
+### Cancel a job
+
+```bash
+curl -sS -X POST http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/cancel
+```
+
+Cancellation is atomic: a conditional DynamoDB transition moves a
+`queued`/`processing` job to `cancelled` and can never overwrite a terminal
+state (`404` unknown id, `409 JOB_NOT_CANCELLABLE` if it already finished).
+The worker re-checks before executing, discards a result that finalises after
+the cancel (deleting the orphaned artifact) and delivers a
+`simulation.cancelled` callback when a webhook is configured.
 
 ### Supported formats
 
@@ -145,7 +180,8 @@ Status lifecycle: `queued → processing → completed | failed`.
 
 ## Webhook contract
 
-On terminal state Quac POSTs to your `webhook_url`:
+When a `webhook_url` was supplied at submission, Quac POSTs to it on terminal
+state:
 
 ```json
 {
@@ -166,7 +202,10 @@ On terminal state Quac POSTs to your `webhook_url`:
 ```
 
 Failures deliver `status: "failed"` with `error` / `error_type` and a null
-`download_url` (including dedicated `simulation.timeout` events).
+`download_url` (including dedicated `simulation.timeout` events). A cancelled
+job delivers `event: "simulation.cancelled"` with `status: "cancelled"` and a
+null `download_url`. Jobs submitted without a `webhook_url` emit no callbacks —
+consumers poll the result endpoint instead.
 
 * **Signing** — `X-Quac-Signature: sha256=<HMAC>` over the exact body bytes
   with `QUAC_WEBHOOK_SECRET`; verify before trusting content.
@@ -202,7 +241,11 @@ docker buildx build --platform linux/arm64 --build-arg TARGETARCH=arm64 \
 
 * **DynamoDB** — `PAY_PER_REQUEST` (bursty, unpredictable MaaS traffic; rationale
   + a fully written-out provisioned/autoscaling alternative in `dynamodb.tf`),
-  Point-in-Time Recovery enabled, TTL on `expires_at`, SSE on.
+  Point-in-Time Recovery enabled, TTL on `expires_at`, SSE on. Every job record
+  carries `owner_id` (default `system` until identity lands) and
+  `schema_version`; the `owner_id-index` GSI (`owner_id` hash + `created_at`
+  range, `ALL` projection) enables tenant-scoped listings without a table scan —
+  mirrored by `scripts/localstack_init.py`.
 * **SQS** — FIFO with content-based deduplication *and* API-computed
   `MessageDeduplicationId`; DLQ with `maxReceiveCount = 3`; visibility timeout
   660 s > Lambda's 600 s cap; queue depth alarm on the DLQ.
@@ -346,8 +389,11 @@ python -m pytest tests -q
 | `test_schemas_firewall.py`      | allow/deny matrix, injection vectors, 28-qubit cap, Pydantic contract |
 | `test_queue_dedup.py`           | dedup-id determinism/precedence, envelope round-trip              |
 | `test_api_endpoints.py`         | 202 flow, 404s, rate-limit 429 + `Retry-After`, no-side-effect rejections |
+| `test_job_results_cancel.py`    | optional webhook, result readiness/artifact mapping, cancel transitions |
+| `test_database_records.py`      | record shape (owner/schema), conditional cancel + guarded updates |
 | `test_simulator_factory.py`     | format converters, MPS-vs-statevector selection, Aer execution    |
 | `test_worker_webhook.py`        | 3-attempt backoff, HMAC signing, SIGALRM budget, batch reporting  |
+| `test_worker_cancellation.py`   | pre-execution cancel/duplicate guards, finalisation race, acks    |
 
 Qiskit-dependent modules skip cleanly (`pytest.importorskip`) when
 `qiskit-aer` is absent; SIGALRM tests skip on non-POSIX hosts (Lambda is Linux).

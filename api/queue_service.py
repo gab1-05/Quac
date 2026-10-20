@@ -102,7 +102,8 @@ def build_message_body(job_id: str, request: SimulationRequest, qubit_count: int
             "circuit_data": request.circuit_data,
             "format": request.format.value,
             "shots": request.shots,
-            "webhook_url": str(request.webhook_url),
+            # Optional: consumers without webhooks poll GET .../result instead.
+            "webhook_url": str(request.webhook_url) if request.webhook_url else None,
             "idempotency_key": request.idempotency_key,
             "qubit_count": qubit_count,
             "schema_version": 1,

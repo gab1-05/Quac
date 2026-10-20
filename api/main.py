@@ -7,9 +7,14 @@ Endpoints
   ``202 Accepted`` plus a fresh UUIDv4 ``job_id``.
 * ``GET  /v1/quantum/jobs/{job_id}`` — job tracking, guarded by a global
   sliding-window rate limiter shared across every route in the process.
+* ``GET  /v1/quantum/jobs/{job_id}/result`` — terminal-state result payload
+  plus a short-lived pre-signed download URL for the full artifact.
+* ``POST /v1/quantum/jobs/{job_id}/cancel`` — atomically cancel a job that
+  has not yet reached a terminal state.
+* ``GET  /v1/quantum/formats`` — supported formats and platform ceilings.
 * ``GET  /healthz`` — liveness probe for the ALB target group.
 
-All blocking I/O (DynamoDB, SQS) is executed off the event loop. Static
+All blocking I/O (DynamoDB, S3, SQS) is executed off the event loop. Static
 circuit validation — including the 28-qubit infrastructure cost firewall —
 runs *before* any side effect is created, so hostile payloads are rejected
 instantly with ``422`` and never reach the compute plane.
@@ -31,10 +36,13 @@ from typing import Any, Final
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from . import __version__, database, queue_service
+from . import __version__, database, queue_service, results_service
 from .schemas import (
     CircuitFormat,
     CircuitValidationError,
+    JobCancelResponse,
+    JobResultPayload,
+    JobResultResponse,
     JobStatus,
     JobStatusResponse,
     QubitLimitExceededError,
@@ -166,6 +174,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         queue_service.shutdown()
+        results_service.shutdown()
         database.shutdown()
         logger.info("quac api stopped")
 
@@ -175,10 +184,25 @@ app = FastAPI(
     description=(
         "Serverless Quantum Simulation Model-as-a-Service. Submit OpenQASM 3.0 "
         "or serialized Qiskit/Cirq circuits for asynchronous execution and "
-        "receive signed result callbacks via webhook."
+        "receive signed result callbacks via webhook — or fetch results "
+        "directly from the result endpoint."
     ),
     version=__version__,
     lifespan=lifespan,
+    openapi_tags=[
+        {
+            "name": "simulation",
+            "description": (
+                "Circuit submission, job tracking, result retrieval and cancellation. "
+                "All long-running work is asynchronous: submit returns a job id, "
+                "then poll the tracking endpoint (or receive a webhook)."
+            ),
+        },
+        {
+            "name": "ops",
+            "description": "Liveness and operational probes.",
+        },
+    ],
 )
 
 
@@ -247,6 +271,7 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
     footprint.
     """
     qubit_count = validate_circuit_payload(request_body.circuit_data, request_body.format)
+    webhook_url = str(request_body.webhook_url) if request_body.webhook_url else None
 
     job_id = _uuid4()
     payload_json = json.dumps(
@@ -254,7 +279,7 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
             "format": request_body.format.value,
             "shots": request_body.shots,
             "qubit_count": qubit_count,
-            "webhook_url": str(request_body.webhook_url),
+            "webhook_url": webhook_url,
             "idempotency_key": request_body.idempotency_key,
         },
         separators=(",", ":"),
@@ -266,7 +291,7 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
             payload_json,
             circuit_format=request_body.format,
             shots=request_body.shots,
-            webhook_url=str(request_body.webhook_url),
+            webhook_url=webhook_url,
             qubit_count=qubit_count,
             idempotency_key=request_body.idempotency_key,
         )
@@ -317,19 +342,12 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
     )
 
 
-@app.get(
-    "/v1/quantum/jobs/{job_id}",
-    response_model=JobStatusResponse,
-    tags=["simulation"],
-    summary="Track a simulation job",
-    dependencies=[Depends(rate_limit)],
-    responses={
-        404: {"description": "Unknown job id"},
-        429: {"description": "Rate limit exceeded"},
-    },
-)
-async def get_job(job_id: str) -> JobStatusResponse:
-    """Return the current lifecycle state of a previously submitted job."""
+async def _fetch_job_record(job_id: str) -> dict[str, Any]:
+    """Resolve a path job id to its record, mapping misses onto 404/503.
+
+    Centralised so every job-scoped route applies identical id-shape checks
+    (strict UUIDv4) and identical failure envelopes.
+    """
     try:
         parsed = uuid.UUID(job_id)
     except (ValueError, AttributeError, TypeError) as exc:
@@ -344,7 +362,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
         )
 
     try:
-        record = await database.get_job_record(job_id)
+        return await database.get_job_record(job_id)
     except database.JobRecordNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -357,16 +375,191 @@ async def get_job(job_id: str) -> JobStatusResponse:
             detail={"error": "PERSISTENCE_UNAVAILABLE", "message": "job store unreachable"},
         ) from exc
 
-    error_message = record.get("error_message")
-    if isinstance(error_message, str) and len(error_message) > MAX_TRACKING_ERROR_CHARS:
-        error_message = error_message[:MAX_TRACKING_ERROR_CHARS] + "…[truncated]"
+
+def _truncate_error(message: str | None) -> str | None:
+    """Bound stored diagnostics so tracking payloads stay small."""
+    if isinstance(message, str) and len(message) > MAX_TRACKING_ERROR_CHARS:
+        return message[:MAX_TRACKING_ERROR_CHARS] + "…[truncated]"
+    return message
+
+
+@app.get(
+    "/v1/quantum/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["simulation"],
+    summary="Track a simulation job",
+    dependencies=[Depends(rate_limit)],
+    responses={
+        404: {"description": "Unknown job id"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+async def get_job(job_id: str) -> JobStatusResponse:
+    """Return the current lifecycle state of a previously submitted job."""
+    record = await _fetch_job_record(job_id)
 
     return JobStatusResponse(
         job_id=str(record["job_id"]),
         status=JobStatus(record.get("status", JobStatus.QUEUED.value)),
         created_at=str(record.get("created_at", "")),
         completed_at=record.get("completed_at"),
-        error_message=error_message,
+        error_message=_truncate_error(record.get("error_message")),
+    )
+
+
+@app.get(
+    "/v1/quantum/jobs/{job_id}/result",
+    response_model=JobResultResponse,
+    tags=["simulation"],
+    summary="Fetch a terminal job's result",
+    dependencies=[Depends(rate_limit)],
+    responses={
+        404: {"description": "Unknown job id"},
+        409: {"description": "Job has not reached a terminal state yet"},
+        429: {"description": "Rate limit exceeded"},
+        503: {"description": "Result artifact store unavailable"},
+    },
+)
+async def get_job_result(job_id: str) -> JobResultResponse:
+    """Return the result payload for a terminal job.
+
+    ``409`` while the job is still queued or processing; ``200`` with
+    ``result: null`` for failed/cancelled jobs; ``200`` with the counts and a
+    pre-signed download URL for completed jobs.
+    """
+    record = await _fetch_job_record(job_id)
+    job_state = JobStatus(record.get("status", JobStatus.QUEUED.value))
+
+    if not job_state.is_terminal:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "JOB_NOT_READY",
+                "message": f"job is {job_state.value}; results arrive at a terminal state",
+                "status": job_state.value,
+            },
+        )
+
+    if job_state is not JobStatus.COMPLETED:
+        return JobResultResponse(
+            job_id=str(record["job_id"]),
+            status=job_state,
+            error_message=_truncate_error(record.get("error_message")),
+        )
+
+    result_key = record.get("result_s3_key")
+    if not isinstance(result_key, str) or not result_key:
+        logger.error("completed job without result artifact job_id=%s", job_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "RESULT_UNAVAILABLE", "message": "result artifact not recorded"},
+        )
+
+    try:
+        document = await results_service.fetch_result_document(result_key)
+        download_url = await results_service.presign_result_url(result_key)
+    except results_service.ResultNotFound:
+        logger.error("result artifact missing job_id=%s key=%s", job_id, result_key)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "RESULT_UNAVAILABLE", "message": "result artifact not found"},
+        ) from None
+    except results_service.ResultUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "RESULT_UNAVAILABLE", "message": str(exc)},
+        ) from exc
+
+    try:
+        payload = JobResultPayload(
+            shots=int(document["shots"]),
+            counts={str(k): int(v) for k, v in dict(document["counts"]).items()},
+            most_frequent=document.get("most_frequent"),
+            method=str(document.get("method", "unknown")),
+            num_qubits=int(document.get("num_qubits", 0)),
+            depth=int(document.get("depth", 0)),
+            simulation_time_ms=document.get("simulation_time_ms"),
+            # Dense statevector maps stay behind the download URL (size ceiling).
+            statevector_probabilities=document.get("statevector_probabilities"),
+            metadata=dict(document.get("metadata") or {}),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.error("result document malformed job_id=%s error=%s", job_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "RESULT_UNAVAILABLE", "message": "result artifact malformed"},
+        ) from exc
+
+    return JobResultResponse(
+        job_id=str(record["job_id"]),
+        status=job_state,
+        result=payload,
+        download_url=download_url,
+        download_expires_in_seconds=results_service.PRESIGNED_URL_TTL_SECONDS,
+    )
+
+
+@app.post(
+    "/v1/quantum/jobs/{job_id}/cancel",
+    response_model=JobCancelResponse,
+    tags=["simulation"],
+    summary="Cancel a job that has not finished",
+    dependencies=[Depends(rate_limit)],
+    responses={
+        404: {"description": "Unknown job id"},
+        409: {"description": "Job already reached a terminal state"},
+        429: {"description": "Rate limit exceeded"},
+        503: {"description": "Job store unavailable"},
+    },
+)
+async def cancel_job(job_id: str) -> JobCancelResponse:
+    """Cancel a queued or running job.
+
+    The transition is conditional in the store: a job that finishes while the
+    cancel request is in flight is *not* overwritten — the request fails with
+    ``409`` instead. A worker that is already computing observes the cancelled
+    status at its next checkpoint and discards the late result.
+    """
+    try:
+        parsed_id = uuid.UUID(job_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
+        ) from exc
+    if parsed_id.version != 4:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
+        )
+
+    try:
+        record = await database.cancel_job_record(job_id)
+    except database.JobRecordNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
+        ) from exc
+    except database.JobNotCancellableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "JOB_NOT_CANCELLABLE",
+                "message": "job already reached a terminal state",
+                "current_status": exc.current_status,
+            },
+        ) from exc
+    except Exception as exc:
+        logger.exception("cancel failed job_id=%s", job_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "PERSISTENCE_UNAVAILABLE", "message": "job store unreachable"},
+        ) from exc
+
+    logger.info("cancel accepted job_id=%s", job_id)
+    return JobCancelResponse(
+        job_id=str(record.get("job_id", job_id)),
+        status=JobStatus(record.get("status", JobStatus.CANCELLED.value)),
     )
 
 

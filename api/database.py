@@ -11,6 +11,7 @@ Public async surface:
 * :func:`create_job_record` — persist a new ``queued`` job.
 * :func:`update_job_status` — transition a job, optionally recording an error.
 * :func:`get_job_record` — fetch a job by ``job_id``.
+* :func:`cancel_job_record` — atomically cancel a non-terminal job.
 """
 
 from __future__ import annotations
@@ -34,6 +35,12 @@ DEFAULT_TABLE_NAME: Final[str] = "quac-jobs"
 DEFAULT_REGION: Final[str] = "us-east-1"
 CONNECTION_POOL_SIZE: Final[int] = 32
 
+DEFAULT_OWNER_ID: Final[str] = "system"
+"""Owner stamped on records created before (or without) authenticated identity."""
+
+RECORD_SCHEMA_VERSION: Final[int] = 1
+"""Version of the job-record attribute schema; bumped on breaking shape changes."""
+
 _BOTO_CONFIG: Final[BotoConfig] = BotoConfig(
     max_pool_connections=CONNECTION_POOL_SIZE,
     retries={"max_attempts": 3, "mode": "standard"},
@@ -45,6 +52,15 @@ _BOTO_CONFIG: Final[BotoConfig] = BotoConfig(
 
 class JobRecordNotFoundError(LookupError):
     """Raised when no DynamoDB item exists for the requested ``job_id``."""
+
+
+class JobNotCancellableError(LookupError):
+    """Raised when a job exists but has already reached a terminal state."""
+
+    def __init__(self, job_id: str, current_status: str) -> None:
+        self.job_id = job_id
+        self.current_status = current_status
+        super().__init__(f"job {job_id} is already {current_status}")
 
 
 class DynamoJobStore:
@@ -102,9 +118,10 @@ class DynamoJobStore:
         *,
         circuit_format: CircuitFormat,
         shots: int,
-        webhook_url: str,
+        webhook_url: str | None,
         qubit_count: int,
         idempotency_key: str | None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         """Insert a new job item in ``queued`` state."""
         table = self._ensure_resource()
@@ -123,6 +140,11 @@ class DynamoJobStore:
             "idempotency_key": idempotency_key,
             "simulation_time_ms": None,
             "result_s3_key": None,
+            # Multi-tenancy groundwork: every record knows its owner so tenant
+            # isolation is enforced in queries (GSI owner_id-index) rather than
+            # in application filtering alone.
+            "owner_id": owner_id or DEFAULT_OWNER_ID,
+            "schema_version": RECORD_SCHEMA_VERSION,
         }
         try:
             table.put_item(
@@ -185,6 +207,49 @@ class DynamoJobStore:
 
         attributes = response.get("Attributes", {})
         logger.info("job record updated job_id=%s status=%s", job_id, status.value)
+        return dict(attributes)
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        """Atomically move a non-terminal job to ``cancelled``.
+
+        The transition is guarded by a condition expression so concurrent
+        completions (worker finishing while the API cancels) resolve to exactly
+        one winner instead of silently overwriting a terminal state.
+
+        Raises:
+            JobRecordNotFoundError: when no item exists for ``job_id``.
+            JobNotCancellableError: when the job already reached a terminal
+                state (completed / failed / cancelled).
+        """
+        table = self._ensure_resource()
+        try:
+            response = table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression="SET #status = :cancelled, completed_at = :done",
+                ConditionExpression=(
+                    "attribute_exists(job_id) AND (#status = :queued OR #status = :processing)"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":cancelled": JobStatus.CANCELLED.value,
+                    ":queued": JobStatus.QUEUED.value,
+                    ":processing": JobStatus.PROCESSING.value,
+                    ":done": datetime.now(UTC).isoformat(),
+                },
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+            if error_code != "ConditionalCheckFailedException":
+                logger.error("DynamoDB cancel failed job_id=%s code=%s", job_id, error_code)
+                raise
+            # The condition failed: either the record is missing (404) or the
+            # job is already terminal (409). One extra read disambiguates.
+            current = self.get(job_id)  # raises JobRecordNotFoundError when absent
+            raise JobNotCancellableError(job_id, str(current.get("status", "unknown"))) from exc
+
+        attributes = response.get("Attributes", {})
+        logger.info("job cancelled job_id=%s", job_id)
         return dict(attributes)
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -258,9 +323,10 @@ async def create_job_record(
     *,
     circuit_format: CircuitFormat,
     shots: int,
-    webhook_url: str,
+    webhook_url: str | None,
     qubit_count: int,
     idempotency_key: str | None,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist a new job record off the event loop."""
     store = _get_store()
@@ -273,6 +339,7 @@ async def create_job_record(
         webhook_url=webhook_url,
         qubit_count=qubit_count,
         idempotency_key=idempotency_key,
+        owner_id=owner_id,
     )
 
 
@@ -302,10 +369,25 @@ async def get_job_record(job_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(store.get, job_id)
 
 
+async def cancel_job_record(job_id: str) -> dict[str, Any]:
+    """Cancel a non-terminal job off the event loop.
+
+    Raises:
+        JobRecordNotFoundError: unknown ``job_id``.
+        JobNotCancellableError: job already reached a terminal state.
+    """
+    store = _get_store()
+    return await asyncio.to_thread(store.cancel, job_id)
+
+
 __all__ = [
+    "DEFAULT_OWNER_ID",
+    "RECORD_SCHEMA_VERSION",
     "CircuitFormat",
     "DynamoJobStore",
+    "JobNotCancellableError",
     "JobRecordNotFoundError",
+    "cancel_job_record",
     "create_job_record",
     "get_job_record",
     "initialise",

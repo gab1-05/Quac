@@ -3,7 +3,8 @@
 
 Creates exactly the resources Terraform provisions in AWS, mirrored locally:
 
-* DynamoDB table ``quac-jobs`` (``job_id`` HASH key, on-demand billing)
+* DynamoDB table ``quac-jobs`` (``job_id`` HASH key, ``owner_id-index`` GSI,
+  on-demand billing)
 * SQS FIFO queue ``quac-jobs.fifo`` + DLQ ``quac-jobs-dlq.fifo``
   (``maxReceiveCount=3`` redrive policy, SHA-256 dedup enabled by default)
 * S3 bucket ``quac-results`` (AES256, full public access block)
@@ -26,9 +27,25 @@ TABLE_NAME = os.environ.get("QUAC_JOBS_TABLE", "quac-jobs")
 QUEUE_NAME = os.environ.get("QUAC_QUEUE_NAME", "quac-jobs.fifo")
 DLQ_NAME = os.environ.get("QUAC_DLQ_NAME", "quac-jobs-dlq.fifo")
 BUCKET_NAME = os.environ.get("QUAC_RESULTS_BUCKET", "quac-results")
+OWNER_GSI_NAME = "owner_id-index"
 
 VISIBILITY_TIMEOUT = int(os.environ.get("QUAC_QUEUE_VISIBILITY", "60"))
 MAX_RECEIVE_COUNT = int(os.environ.get("QUAC_MAX_RECEIVE_COUNT", "3"))
+
+_TABLE_KEY_SCHEMA = [{"AttributeName": "job_id", "KeyType": "HASH"}]
+_TABLE_ATTRIBUTE_DEFS = [
+    {"AttributeName": "job_id", "AttributeType": "S"},
+    {"AttributeName": "owner_id", "AttributeType": "S"},
+    {"AttributeName": "created_at", "AttributeType": "S"},
+]
+_OWNER_GSI_SPEC = {
+    "IndexName": OWNER_GSI_NAME,
+    "KeySchema": [
+        {"AttributeName": "owner_id", "KeyType": "HASH"},
+        {"AttributeName": "created_at", "KeyType": "RANGE"},
+    ],
+    "Projection": {"ProjectionType": "ALL"},
+}
 
 
 def ensure_dynamodb(client) -> None:
@@ -36,6 +53,7 @@ def ensure_dynamodb(client) -> None:
     try:
         client.describe_table(TableName=TABLE_NAME)
         print(f"[init] dynamodb table already present: {TABLE_NAME}")
+        _ensure_owner_gsi(client)
         return
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
@@ -43,14 +61,30 @@ def ensure_dynamodb(client) -> None:
 
     client.create_table(
         TableName=TABLE_NAME,
-        KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
-        AttributeDefinitions=[{"AttributeName": "job_id", "AttributeType": "S"}],
+        KeySchema=_TABLE_KEY_SCHEMA,
+        AttributeDefinitions=_TABLE_ATTRIBUTE_DEFS,
         BillingMode="PAY_PER_REQUEST",
+        GlobalSecondaryIndexes=[_OWNER_GSI_SPEC],
         Tags=[{"Key": "Project", "Value": "quac"}, {"Key": "Environment", "Value": "local"}],
     )
     waiter = client.get_waiter("table_exists")
     waiter.wait(TableName=TABLE_NAME, WaiterConfig={"Delay": 2, "MaxAttempts": 30})
-    print(f"[init] dynamodb table created: {TABLE_NAME}")
+    print(f"[init] dynamodb table created: {TABLE_NAME} (+ {OWNER_GSI_NAME} GSI)")
+
+
+def _ensure_owner_gsi(client) -> None:
+    """Add the owner index to a pre-existing table that lacks it."""
+    description = client.describe_table(TableName=TABLE_NAME)["Table"]
+    existing = {g.get("IndexName") for g in description.get("GlobalSecondaryIndexes", [])}
+    if OWNER_GSI_NAME in existing:
+        print(f"[init] dynamodb GSI already present: {OWNER_GSI_NAME}")
+        return
+    client.update_table(
+        TableName=TABLE_NAME,
+        AttributeDefinitions=_TABLE_ATTRIBUTE_DEFS,
+        GlobalSecondaryIndexUpdates=[{"Create": _OWNER_GSI_SPEC}],
+    )
+    print(f"[init] dynamodb GSI added: {OWNER_GSI_NAME}")
 
 
 def ensure_queue(client, name: str, *, fifo: bool) -> str:

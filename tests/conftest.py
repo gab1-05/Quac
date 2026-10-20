@@ -123,7 +123,7 @@ def stubbed_backend(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     from api.schemas import JobStatus
 
     store: dict[str, dict[str, Any]] = {}
-    calls: dict[str, list[Any]] = {"create": [], "update": [], "enqueue": []}
+    calls: dict[str, list[Any]] = {"create": [], "update": [], "enqueue": [], "cancel": []}
 
     async def fake_create(
         job_id: str,
@@ -131,9 +131,10 @@ def stubbed_backend(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         *,
         circuit_format: Any,
         shots: int,
-        webhook_url: str,
+        webhook_url: str | None,
         qubit_count: int,
         idempotency_key: str | None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         record = {
             "job_id": job_id,
@@ -159,11 +160,24 @@ def stubbed_backend(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         error_message: str | None = None,
         simulation_time_ms: int | None = None,
         result_s3_key: str | None = None,
+        unless_cancelled: bool = False,
     ) -> dict[str, Any]:
+        del unless_cancelled  # guarded transitions are exercised against DynamoDB fakes
         record = store[job_id]
         record["status"] = status.value
         record["error_message"] = error_message
         calls["update"].append((job_id, status.value))
+        return record
+
+    async def fake_cancel(job_id: str) -> dict[str, Any]:
+        if job_id not in store:
+            raise database.JobRecordNotFoundError(job_id)
+        record = store[job_id]
+        if record["status"] not in (JobStatus.QUEUED.value, JobStatus.PROCESSING.value):
+            raise database.JobNotCancellableError(job_id, str(record["status"]))
+        record["status"] = JobStatus.CANCELLED.value
+        record["completed_at"] = "2026-10-19T00:00:00+00:00"
+        calls["cancel"].append(job_id)
         return record
 
     async def fake_get(job_id: str) -> dict[str, Any]:
@@ -178,6 +192,7 @@ def stubbed_backend(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(database, "create_job_record", fake_create)
     monkeypatch.setattr(database, "update_job_status", fake_update)
     monkeypatch.setattr(database, "get_job_record", fake_get)
+    monkeypatch.setattr(database, "cancel_job_record", fake_cancel)
     monkeypatch.setattr(queue_service, "enqueue_simulation", fake_enqueue)
 
     return {"store": store, "calls": calls}

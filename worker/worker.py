@@ -30,8 +30,11 @@ Failure taxonomy
 ----------------
 Business failures (parse errors, OOM, simulation errors, timeouts) are
 recorded, webhook-notified, and *swallowed* — the SQS record is completed.
-Only infrastructure failures (DynamoDB/S3 client errors) surface as
-``batchItemFailures`` so AWS can retry those specific records.
+Cancellation is also a business outcome: a job cancelled between dequeue and
+execution (or while finalising) is discarded with a ``simulation.cancelled``
+callback and the message is acknowledged. Only infrastructure failures
+(DynamoDB/S3 client errors) surface as ``batchItemFailures`` so AWS can retry
+those specific records.
 """
 
 from __future__ import annotations
@@ -118,6 +121,16 @@ class SimulationTimeoutError(TimeoutError):
 
 class InfrastructureError(RuntimeError):
     """Raised for AWS-side failures that should be retried by SQS."""
+
+
+class JobCancelledError(RuntimeError):
+    """The job was cancelled concurrently; the current work must be discarded.
+
+    Raised by guarded status transitions (``unless_cancelled``) whenever the
+    stored record has already moved to ``cancelled``. Treated as a *business*
+    outcome: the SQS record is acknowledged, no failure is written, and a
+    ``simulation.cancelled`` webhook is delivered.
+    """
 
 
 # --------------------------------------------------------------------------------------
@@ -210,11 +223,22 @@ def _update_job_status(
     error_message: str | None = None,
     simulation_time_ms: int | None = None,
     result_s3_key: str | None = None,
+    unless_cancelled: bool = False,
 ) -> None:
-    """Transition a job item, raising :class:`InfrastructureError` on AWS faults."""
+    """Transition a job item, raising :class:`InfrastructureError` on AWS faults.
+
+    When ``unless_cancelled`` is set, the update is guarded by a condition that
+    refuses to overwrite a ``cancelled`` record; a violation raises
+    :class:`JobCancelledError` instead of silently resurrecting the job.
+    """
     names: dict[str, str] = {"#status": "status"}
     values: dict[str, Any] = {":status": status}
     updates = ["#status = :status"]
+    condition: str | None = None
+
+    if unless_cancelled:
+        values[":cancelled"] = "cancelled"
+        condition = "#status <> :cancelled"
 
     if error_message is not None:
         updates.append("error_message = :err")
@@ -229,27 +253,49 @@ def _update_job_status(
         updates.append("completed_at = :done")
         values[":done"] = datetime.now(UTC).isoformat()
 
+    kwargs: dict[str, Any] = {
+        "Key": {"job_id": job_id},
+        "UpdateExpression": "SET " + ", ".join(updates),
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": values,
+    }
+    if condition is not None:
+        kwargs["ConditionExpression"] = condition
+
     try:
-        _get_dynamodb().Table(JOBS_TABLE).update_item(
-            Key={"job_id": job_id},
-            UpdateExpression="SET " + ", ".join(updates),
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues=values,
-        )
-    except (ClientError, BotoCoreError) as exc:
+        _get_dynamodb().Table(JOBS_TABLE).update_item(**kwargs)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+        if error_code == "ConditionalCheckFailedException" and unless_cancelled:
+            # Confirm the cancellation before classifying the failure.
+            current = _read_job_record(job_id)
+            if current is not None and current.get("status") == "cancelled":
+                raise JobCancelledError(f"job {job_id} was cancelled") from exc
+            # Attribute vanished or another state raced in: treat as infra.
+        logger.error("dynamodb update failed job_id=%s error=%s", job_id, exc)
+        raise InfrastructureError(f"dynamodb update failed: {exc}") from exc
+    except BotoCoreError as exc:
         logger.error("dynamodb update failed job_id=%s error=%s", job_id, exc)
         raise InfrastructureError(f"dynamodb update failed: {exc}") from exc
 
 
-def _read_job_webhook_url(job_id: str) -> str | None:
-    """Fetch the consumer webhook URL recorded at ingest time."""
+def _read_job_record(job_id: str) -> dict[str, Any] | None:
+    """Read the full job item; ``None`` when missing or unreachable."""
     try:
         response = _get_dynamodb().Table(JOBS_TABLE).get_item(Key={"job_id": job_id})
     except (ClientError, BotoCoreError) as exc:
         logger.warning("dynamodb read failed job_id=%s error=%s", job_id, exc)
         return None
-    item = response.get("Item") or {}
-    webhook = item.get("webhook_url")
+    item = response.get("Item")
+    return dict(item) if item else None
+
+
+def _read_job_webhook_url(job_id: str) -> str | None:
+    """Fetch the consumer webhook URL recorded at ingest time."""
+    record = _read_job_record(job_id)
+    if not record:
+        return None
+    webhook = record.get("webhook_url")
     return str(webhook) if webhook else None
 
 
@@ -293,6 +339,16 @@ def _presign_download(key: str) -> str:
     except (ClientError, BotoCoreError) as exc:
         logger.error("presign failed key=%s error=%s", key, exc)
         raise InfrastructureError(f"presign failed: {exc}") from exc
+
+
+def _delete_result_object(key: str) -> None:
+    """Best-effort removal of an artifact whose job was cancelled mid-write."""
+    try:
+        _get_s3().delete_object(Bucket=RESULTS_BUCKET, Key=key)
+        logger.info("removed orphaned result object key=%s", key)
+    except (ClientError, BotoCoreError) as exc:
+        # Lifecycle rules eventually reclaim the object; never fail the ack.
+        logger.warning("could not delete orphaned key=%s error=%s", key, exc)
 
 
 # --------------------------------------------------------------------------------------
@@ -405,6 +461,27 @@ def dispatch_webhook(url: str, payload: dict[str, Any]) -> bool:
         return False
 
 
+def _dispatch_cancelled_webhook(
+    job_id: str, webhook_url: str | None, elapsed_ms: int
+) -> None:
+    """Notify the consumer that the job ended in ``cancelled`` state."""
+    if not webhook_url:
+        return
+    dispatch_webhook(
+        webhook_url,
+        {
+            "event": "simulation.cancelled",
+            "job_id": job_id,
+            "status": "cancelled",
+            "error": "job cancelled",
+            "error_type": "JobCancelledError",
+            "simulation_time_ms": elapsed_ms,
+            "completed_at": datetime.now(UTC).isoformat(),
+            "download_url": None,
+        },
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Failure handling — write diagnostics, mark failed, fire webhook, complete
 # --------------------------------------------------------------------------------------
@@ -422,12 +499,20 @@ def _handle_business_failure(
     summary = f"{type(exc).__name__}: {exc}"
     trace_excerpt = trace[-ERROR_TRACE_MAX_CHARS:]
 
-    _update_job_status(
-        job_id,
-        "failed",
-        error_message=f"{summary}\n{trace_excerpt}",
-        simulation_time_ms=elapsed_ms,
-    )
+    try:
+        _update_job_status(
+            job_id,
+            "failed",
+            error_message=f"{summary}\n{trace_excerpt}",
+            simulation_time_ms=elapsed_ms,
+            unless_cancelled=True,
+        )
+    except JobCancelledError:
+        # Cancel wins over the failure record: the consumer receives a
+        # simulation.cancelled event instead of a failure event.
+        logger.info("job cancelled while failing; failure record skipped job_id=%s", job_id)
+        _dispatch_cancelled_webhook(job_id, webhook_url, elapsed_ms)
+        return
 
     if webhook_url:
         dispatch_webhook(
@@ -453,12 +538,18 @@ def _handle_timeout_failure(
 ) -> None:
     """Challenge #3 terminal path: dump ``Timeout Error`` and notify."""
     logger.error("timeout guard fired job_id=%s elapsed_ms=%d", job_id, elapsed_ms)
-    _update_job_status(
-        job_id,
-        "failed",
-        error_message=f"Timeout Error: {exc}",
-        simulation_time_ms=elapsed_ms,
-    )
+    try:
+        _update_job_status(
+            job_id,
+            "failed",
+            error_message=f"Timeout Error: {exc}",
+            simulation_time_ms=elapsed_ms,
+            unless_cancelled=True,
+        )
+    except JobCancelledError:
+        logger.info("job cancelled while timing out; failure record skipped job_id=%s", job_id)
+        _dispatch_cancelled_webhook(job_id, webhook_url, elapsed_ms)
+        return
 
     if webhook_url:
         dispatch_webhook(
@@ -571,9 +662,29 @@ def _process_record(record: dict[str, Any], context: Any) -> None:
         return
 
     job_id = str(envelope["job_id"])
-    webhook_url = str(envelope.get("webhook_url") or "") or _read_job_webhook_url(job_id) or ""
+    job_record = _read_job_record(job_id)
+    stored_status = str(job_record.get("status", "")) if job_record else ""
+    webhook_url = (
+        str(envelope.get("webhook_url") or "")
+        or str((job_record or {}).get("webhook_url") or "")
+        or ""
+    )
     started = time.perf_counter()
     budget = min(_remaining_budget_seconds(context), float(TIMEOUT_GUARD_SECONDS))
+
+    # --- pre-execution guards -------------------------------------------------------
+    # A cancelled job must never start computing, and a redelivered message for
+    # an already-terminal job must not run (or bill) twice.
+    if stored_status == "cancelled":
+        logger.info("job already cancelled before execution job_id=%s", job_id)
+        raise JobCancelledError(f"job {job_id} was cancelled before execution started")
+    if stored_status in ("completed", "failed"):
+        logger.info(
+            "duplicate delivery for terminal job job_id=%s status=%s; acknowledging",
+            job_id,
+            stored_status,
+        )
+        return
 
     logger.info(
         "processing job_id=%s message_id=%s format=%s shots=%s budget=%.1fs",
@@ -584,7 +695,7 @@ def _process_record(record: dict[str, Any], context: Any) -> None:
         budget,
     )
 
-    _update_job_status(job_id, "processing")
+    _update_job_status(job_id, "processing", unless_cancelled=True)
 
     _arm_timeout_guard(int(budget))
     try:
@@ -636,12 +747,18 @@ def _process_record(record: dict[str, Any], context: Any) -> None:
     }
     _upload_result(key, document)
     download_url = _presign_download(key)
-    _update_job_status(
-        job_id,
-        "completed",
-        simulation_time_ms=simulation_time_ms,
-        result_s3_key=key,
-    )
+    try:
+        _update_job_status(
+            job_id,
+            "completed",
+            simulation_time_ms=simulation_time_ms,
+            result_s3_key=key,
+            unless_cancelled=True,
+        )
+    except JobCancelledError:
+        # Cancelled while finalising: the artifact must not outlive the job.
+        _delete_result_object(key)
+        raise
 
     logger.info("job completed job_id=%s time_ms=%d key=%s", job_id, simulation_time_ms, key)
 
@@ -663,6 +780,14 @@ def _process_record_guarded(record: dict[str, Any], context: Any) -> bool:
 
     try:
         _process_record(record, context)
+        return True
+    except JobCancelledError:
+        _disarm_timeout_guard()
+        job_id = _safe_job_id(record) or "unknown"
+        webhook = _read_job_webhook_url(job_id)
+        elapsed = int((time.perf_counter() - started) * 1000)
+        logger.info("job cancelled; work discarded job_id=%s elapsed_ms=%d", job_id, elapsed)
+        _dispatch_cancelled_webhook(job_id, webhook, elapsed)
         return True
     except InfrastructureError:
         _disarm_timeout_guard()
@@ -755,6 +880,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
 __all__ = [
     "InfrastructureError",
+    "JobCancelledError",
     "SimulationTimeoutError",
     "dispatch_webhook",
     "lambda_handler",
