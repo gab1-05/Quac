@@ -1,9 +1,10 @@
 # =============================================================================
-# Quac CI — quality gate, IaC validation, and a full local end-to-end run.
+# Quac CI — quality gate, IaC validation, web build, and a full local e2e run.
 #
 # Jobs
 #   quality   ruff + mypy + pytest against the pinned production dependency set
 #   terraform fmt -check, init -backend=false, validate (no AWS credentials)
+#   web       npm ci + tsc -b + vite build for the console in web/
 #   e2e       boots the docker-compose LocalStack stack, provisions the mirrored
 #             resources, and drives API -> SQS -> worker -> S3 -> webhook with
 #             scripts/e2e.py (also proves both container images build & boot)
@@ -85,6 +86,27 @@ jobs:
       - name: Validate
         run: terraform validate -no-color
 
+  web:
+    name: Web console build (tsc + vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
+
   security:
     name: Trivy scan (vuln, misconfig, secret)
     runs-on: ubuntu-latest
@@ -102,7 +124,10 @@ jobs:
           severity: HIGH,CRITICAL
           format: table
           exit-code: "1"
-          skip-dirs: .terraform
+          # .terraform: provider binaries, validated by the terraform job.
+          # web/node_modules + web/dist: vendored npm deps and their build
+          # output; the web job pins and rebuilds them from package-lock.json.
+          skip-dirs: .terraform,web/node_modules,web/dist
           trivyignores: .trivyignore
 
   e2e:

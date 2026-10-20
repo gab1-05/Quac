@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* ---- Design tokens (P7 design system) ------------------------------------
+   Dark-first: deep navy surfaces + cyan accent. The light theme flips the
+   CSS variables through the `.light` class on <html>; components use the
+   semantic Tailwind aliases (bg-surface, text-ink, border-line, text-accent,
+   …) so every surface works in both themes without per-component checks. */
+:root {
+  --q-bg: #0b1220; /* page canvas — deep navy */
+  --q-surface: #101a30; /* raised cards */
+  --q-surface-2: #0d1526; /* inset panels (editor, code) */
+  --q-line: #1e2b45; /* hairline borders */
+  --q-line-strong: #2b3c5e;
+  --q-ink: #c8d3e6; /* body text */
+  --q-ink-strong: #f2f6fc; /* headings */
+  --q-ink-muted: #7c8bab; /* secondary text */
+  --q-accent: #22d3ee; /* cyan action colour */
+  --q-accent-ink: #04222a; /* text on accent fills */
+  --q-ok: #34d399;
+  --q-warn: #fbbf24;
+  --q-err: #f87171;
+}
+
+html.light {
+  --q-bg: #f4f6fb;
+  --q-surface: #ffffff;
+  --q-surface-2: #eef2f9;
+  --q-line: #d7dfee;
+  --q-line-strong: #b9c6dc;
+  --q-ink: #33405a;
+  --q-ink-strong: #0b1220;
+  --q-ink-muted: #5f6e8c;
+  --q-accent: #0891b2;
+  --q-accent-ink: #ffffff;
+  --q-ok: #059669;
+  --q-warn: #b45309;
+  --q-err: #dc2626;
+}
+
+@theme inline {
+  --color-bg: var(--q-bg);
+  --color-surface: var(--q-surface);
+  --color-surface-2: var(--q-surface-2);
+  --color-line: var(--q-line);
+  --color-line-strong: var(--q-line-strong);
+  --color-ink: var(--q-ink);
+  --color-ink-strong: var(--q-ink-strong);
+  --color-ink-muted: var(--q-ink-muted);
+  --color-accent: var(--q-accent);
+  --color-accent-ink: var(--q-accent-ink);
+  --color-ok: var(--q-ok);
+  --color-warn: var(--q-warn);
+  --color-err: var(--q-err);
+  --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+html,
+body {
+  background: var(--q-bg);
+  color: var(--q-ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+/* Visible keyboard focus everywhere. */
+:focus-visible {
+  outline: 2px solid var(--q-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

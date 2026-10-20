@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1220" />
+    <meta
+      name="description"
+      content="Quac console — analyse quantum circuits, run simulations on the backend selector, and track jobs."
+    />
+    <title>Quac Console</title>
+    <script>
+      // Apply the stored theme before first paint (dark is the default).
+      try {
+        var t = localStorage.getItem('quac.console.theme')
+        if (t === 'light') document.documentElement.classList.add('light')
+      } catch (e) {
+        /* storage unavailable — keep the dark default */
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

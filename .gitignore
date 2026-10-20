@@ -10,6 +10,9 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# ---- Browser-automation artifacts (playwright MCP) ----
+.playwright-mcp/
+
 # ---- Terraform ----
 .terraform/
 .terraform.lock.hcl

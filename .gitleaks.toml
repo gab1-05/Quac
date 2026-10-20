@@ -14,4 +14,8 @@ regexes = [
 paths = [
   '''api/schemas\.py''',
   '''README\.md''',
+  # Vendored npm dependencies and the console build output; the web CI job
+  # pins and rebuilds them from web/package-lock.json.
+  '''web/node_modules/''',
+  '''web/dist/''',
 ]

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Quac mark: cyan Q (circle + tail) on the deep-navy console surface. -->
+  <rect width="32" height="32" rx="7" fill="#0b1220"/>
+  <circle cx="15" cy="14.5" r="7" fill="none" stroke="#22d3ee" stroke-width="3"/>
+  <path d="M19.5 19.5 L25 25.5" stroke="#22d3ee" stroke-width="3" stroke-linecap="round"/>
+</svg>

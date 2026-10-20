@@ -1,6 +1,6 @@
 # Quac — Serverless Quantum Simulation Model-as-a-Service (MaaS)
 
-[![CI](https://github.com/gab1-05/Quac/actions/workflows/ci.yml/badge.svg)](https://github.com/gab1-05/Quac/actions/workflows/ci.yml)
+[![CI](https://github.com/gab1-05/QuacSM/actions/workflows/ci.yml/badge.svg)](https://github.com/gab1-05/QuacSM/actions/workflows/ci.yml)
 
 **Quac** is a production-grade, serverless platform that accepts quantum circuits
 (OpenQASM 3.0 strings or serialized Qiskit/Cirq JSON), processes them
@@ -62,6 +62,27 @@ quantum-maas-platform/
 │   ├── variables.tf  outputs.tf
 │   ├── iam.tf                  # PoLP roles scoped to this workspace's ARNs
 │   ├── dynamodb.tf  sqs.tf  s3.tf
+├── web/                        # React + Vite + TypeScript + Tailwind console
+│   ├── src/
+│   │   ├── api/
+│   │   │   ├── schema.ts       # types generated from the FastAPI OpenAPI spec
+│   │   │   └── client.ts       # typed fetch client + normalised ApiError envelope
+│   │   ├── components/
+│   │   │   ├── Shell.tsx       # nav, API status pill (GET /healthz), theme toggle
+│   │   │   └── ui.tsx          # Card/Badge/Stat/ErrorBanner/Skeleton/…
+│   │   ├── lib/
+│   │   │   ├── history.ts      # browser-local submission history (localStorage)
+│   │   │   ├── theme.tsx       # dark-first theme provider (dark/light/system)
+│   │   │   ├── format.ts       # bytes/seconds/USD/timestamp display helpers
+│   │   │   └── hooks.ts        # useDebouncedValue
+│   │   ├── pages/
+│   │   │   ├── Overview.tsx    # API status, platform limits, recent submissions
+│   │   │   ├── Studio.tsx      # circuit editor + live analyze + run
+│   │   │   ├── Jobs.tsx        # lookup by id + browser-local history
+│   │   │   └── JobDetail.tsx   # live status polling + result document + cancel
+│   │   └── index.css           # Tailwind v4 + design tokens (dark-first)
+│   ├── vite.config.ts          # dev proxy /v1 + /healthz → localhost:8000
+│   └── package.json            # react 19, react-router 7, @tanstack/react-query 5
 ├── tests/                      # pytest suite (213 tests)
 ├── scripts/                    # local end-to-end runtime (LocalStack)
 │   ├── localstack_init.py      # idempotent table/queue/bucket bootstrap
@@ -69,7 +90,7 @@ quantum-maas-platform/
 │   ├── webhook_receiver.py     # HMAC-verifying callback sink
 │   └── e2e.py                  # drives API → SQS → worker → S3 → webhook
 ├── docker-compose.yml          # localstack + api + worker + webhook + e2e
-├── .github/workflows/ci.yml    # ruff · mypy · pytest · gitleaks · terraform · e2e
+├── .github/workflows/ci.yml    # ruff · mypy · pytest · gitleaks · terraform · web · e2e
 ├── pyproject.toml              # ruff + mypy + pytest configuration
 ├── .gitleaks.toml              # secret-scan allowlist (documented example UUID)
 └── README.md
@@ -266,6 +287,64 @@ overestimates low-entanglement circuits; the `note` field says so.
 
 ---
 
+## Web console (P7 thin)
+
+`web/` is a React + Vite + TypeScript + Tailwind console in front of the same
+public API the CLI uses — same origin, no separate backend, no CORS. During
+development the Vite dev server proxies `/v1` and `/healthz` to
+`localhost:8000` (`web/vite.config.ts`); the thin slice does not yet ship its
+own container (nginx serving + the compose `web` service are P7.15).
+
+### Run it locally
+
+```bash
+docker compose up -d localstack api worker   # API on localhost:8000
+cd web
+npm ci
+npm run dev                                   # console on localhost:5173
+```
+
+`npm run build` type-checks (`tsc -b`) and bundles for production; the CI
+`web` job runs exactly `npm ci` + `npm run build`.
+
+The API types in `web/src/api/schema.ts` are generated from the live FastAPI
+spec — regenerate after any contract change and commit the result:
+
+```bash
+npx openapi-typescript http://localhost:8000/openapi.json -o src/api/schema.ts
+```
+
+### Pages and what each one does
+
+| Route            | Page         | Functions                                                                     |
+|------------------|--------------|-------------------------------------------------------------------------------|
+| `/`              | **Overview** | live API health (`GET /healthz`), platform limits (`GET /v1/quantum/formats`: max qubits/shots, accepted formats), browser-local recent submissions |
+| `/studio`        | **Studio**   | circuit editor (OpenQASM 3 / Qiskit JSON / Cirq JSON), debounced pre-flight analysis (`POST /v1/quantum/analyze`: size, depth, estimated runtime/memory, backend recommendation + reason), backend override picker, run submission (`POST /v1/quantum/simulate`) with shot count and webhook options, structured firewall errors rendered with line/column hints |
+| `/jobs`          | **Jobs**     | lookup any job by id (`GET /v1/quantum/jobs/{id}`), browser-local history of this browser's submissions (newest 25) with live status refresh |
+| `/jobs/:jobId`   | **JobDetail**| live status polling (2 s while queued/running), full result document (counts, exact probabilities, backend, cost, memory, wall, S3 link) once completed, cancel action (`POST .../cancel`) while queued |
+
+Shared pieces: `Shell.tsx` (nav, API status pill from `/healthz`, dark/light/
+system theme toggle — dark-first), `ui.tsx` (Card/Badge/Stat/ErrorBanner/
+Skeleton/EmptyState), `client.ts` (typed fetch, normalises the API's
+`{detail}` error envelope into `ApiError`), `history.ts` (localStorage).
+
+### Honest scope notes (thin slice)
+
+* **Job history is browser-local** (`localStorage`) because the API has no
+  owner-scoped job *list* endpoint yet — that arrives with P1 auth. The list
+  is never fabricated from server data it cannot see.
+* **No auth screens yet** — login/register land with P1; until then the
+  console drives the same unauthenticated public API the README documents.
+* **The editor is a plain monospace textarea** — CodeMirror with syntax
+  highlighting, gutter and error markers is P7.4.
+* **No unit tests / served container yet** — vitest component tests are
+  P7.16; the nginx + compose serving path is P7.15. The CI `web` job is a
+  build gate (type-check + bundle), and the pages were verified by driving
+  the real compose stack in a browser (analyze, submit → poll → result,
+  firewall error rendering, theme toggle).
+
+---
+
 ## Webhook contract
 
 When a `webhook_url` was supplied at submission, Quac POSTs to it on terminal
@@ -434,12 +513,13 @@ idempotent and mirrors the Terraform-provisioned resources exactly.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs three jobs on every push/PR:
+`.github/workflows/ci.yml` runs five jobs on every push/PR:
 
 | Job         | Steps                                                                 |
 |-------------|-----------------------------------------------------------------------|
 | `quality`   | ruff · mypy · pytest · gitleaks (against the pinned prod dependencies)|
 | `terraform` | `fmt -check` · `init -backend=false` · `validate`                     |
+| `web`       | `npm ci` · `tsc -b` · `vite build` (the console in `web/`)            |
 | `security`  | trivy — dep CVEs, IaC/Dockerfile/compose misconfig, leaked secrets    |
 | `e2e`       | builds both images, boots the LocalStack stack, drives the full path  |
 
