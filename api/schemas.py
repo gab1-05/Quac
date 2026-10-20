@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 
@@ -118,6 +118,17 @@ class QubitLimitExceededError(CircuitValidationError):
         )
 
 
+def reject_oversized_circuit_data(value: str | dict[str, Any]) -> str | dict[str, Any]:
+    """Enforce the hard byte ceiling on a circuit payload.
+
+    Shared by every request model carrying a ``circuit_data`` field.
+    """
+    serialized = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > MAX_CIRCUIT_BYTES:
+        raise ValueError(f"circuit_data exceeds the {MAX_CIRCUIT_BYTES} byte platform ceiling")
+    return value
+
+
 # --------------------------------------------------------------------------------------
 # Pydantic v2 wire contracts
 # --------------------------------------------------------------------------------------
@@ -198,12 +209,7 @@ class SimulationRequest(BaseModel):
     @classmethod
     def _reject_oversized_payload(cls, value: str | dict[str, Any]) -> str | dict[str, Any]:
         """Enforce the hard byte ceiling before any downstream processing."""
-        serialized = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
-        if len(serialized.encode("utf-8")) > MAX_CIRCUIT_BYTES:
-            raise ValueError(
-                f"circuit_data exceeds the {MAX_CIRCUIT_BYTES} byte platform ceiling"
-            )
-        return value
+        return reject_oversized_circuit_data(value)
 
 
 class JobStatusResponse(BaseModel):
@@ -324,6 +330,260 @@ class JobCancelResponse(BaseModel):
     job_id: str
     status: JobStatus
     detail: str = "job cancelled; a running simulation is stopped at its next checkpoint"
+
+
+# --------------------------------------------------------------------------------------
+# Pre-flight analysis contracts (POST /v1/quantum/analyze)
+# --------------------------------------------------------------------------------------
+
+
+class AnalysisRequest(BaseModel):
+    """Ingestion contract for ``POST /v1/quantum/analyze``.
+
+    Same firewall rules as simulation ingestion, but the request is answered
+    synchronously and never persists or enqueues anything.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        json_schema_extra={
+            "example": {
+                "circuit_data": (
+                    "OPENQASM 3.0;\n"
+                    "include \"stdgates.inc\";\n"
+                    "qubit[2] q;\n"
+                    "bit[2] c;\n"
+                    "h q[0];\n"
+                    "cx q[0], q[1];\n"
+                    "c = measure q;\n"
+                ),
+                "format": "qasm3",
+                "shots": 1024,
+            }
+        },
+    )
+
+    circuit_data: str | dict[str, Any] = Field(
+        ...,
+        description=(
+            "Raw circuit payload: an OpenQASM 3.0 source string, or a dictionary "
+            "structure for serialized Qiskit / Cirq documents."
+        ),
+    )
+    format: CircuitFormat = Field(
+        ...,
+        description="Serialization format of ``circuit_data``.",
+    )
+    shots: int = Field(
+        default=1024,
+        ge=1,
+        le=8192,
+        description="Sample count used to scale the runtime/cost estimate band.",
+    )
+
+    @field_validator("circuit_data")
+    @classmethod
+    def _reject_oversized_payload(cls, value: str | dict[str, Any]) -> str | dict[str, Any]:
+        """Enforce the hard byte ceiling before any downstream processing."""
+        return reject_oversized_circuit_data(value)
+
+
+class AnalysisArityCounts(BaseModel):
+    """Gate counts grouped by operand arity (measures excluded)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    one_qubit: int
+    two_qubit: int
+    three_plus_qubit: int
+
+
+class AnalysisCriticalPath(BaseModel):
+    """ASAP-scheduled critical path: the deepest layer and its participants."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    length: int = Field(..., description="Layer count along the critical path (= depth).")
+    qubits: list[int] = Field(..., description="Qubits participating in the deepest layer.")
+    gates: dict[str, int] = Field(..., description="Histogram of the deepest-layer operations.")
+
+
+class AnalysisInteraction(BaseModel):
+    """Structural two-qubit interaction-graph proxies.
+
+    These describe connectivity only — not entanglement. See ``note``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    edges: list[tuple[int, int]] = Field(
+        ..., description="Unique interacting qubit pairs (every >=2q gate contributes)."
+    )
+    edge_operations: int = Field(..., description="Operations touching two or more qubits.")
+    components: int = Field(..., description="Connected components over all qubit nodes.")
+    component_sizes: list[int] = Field(..., description="Component sizes, descending.")
+    max_component_qubits: int
+    bridge_edges: int = Field(
+        ..., description="Edges whose removal would disconnect the interaction graph."
+    )
+    max_interaction_span: int = Field(
+        ..., description="Largest qubit-index distance between interacting qubits."
+    )
+    two_qubit_depth: int = Field(
+        ..., description="ASAP layers counting only >=2q operations (hardware-relevant)."
+    )
+    note: str = Field(
+        ..., description="Fixed disclaimer: proxies are structural, not entanglement."
+    )
+
+
+class AnalysisExactInteger(BaseModel):
+    """An exactly-derived integer (``basis: exact``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: int
+    basis: Literal["exact"]
+    note: str
+
+
+class AnalysisRange(BaseModel):
+    """A heuristic band (``basis: estimated``) with its uncertainty stated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    low: float
+    high: float
+    basis: Literal["estimated"]
+    note: str
+
+
+class AnalysisMethodChoice(BaseModel):
+    """The deterministic method-selection rule (``basis: rule``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str
+    basis: Literal["rule"]
+    note: str
+
+
+class AnalysisEstimates(BaseModel):
+    """Labelled estimates; every member declares its ``basis``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    statevector_memory_bytes: AnalysisExactInteger
+    runtime_seconds: AnalysisRange
+    compute_cost_usd: AnalysisRange
+    recommended_method: AnalysisMethodChoice
+
+
+class AnalysisWarning(BaseModel):
+    """A warning or optimisation opportunity raised during analysis."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    severity: Literal["info", "warning", "opportunity"]
+    message: str
+
+
+class AnalysisRecommendation(BaseModel):
+    """Backend recommendation seed (the selector in P3 extends this)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: str
+    reasons: list[str]
+    caveats: list[str]
+
+
+class CircuitAnalysisResponse(BaseModel):
+    """``POST /v1/quantum/analyze`` body — the pre-flight report."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "format": "qasm3",
+                "shots": 1024,
+                "num_qubits": 2,
+                "num_clbits": 2,
+                "depth": 3,
+                "total_operations": 4,
+                "gate_histogram": {"h": 1, "cx": 1, "measure": 2},
+                "arity": {"one_qubit": 1, "two_qubit": 1, "three_plus_qubit": 0},
+                "measurement_count": 2,
+                "parameter_count": 0,
+                "unbound_parameter_names": [],
+                "executable": True,
+                "two_qubit_density": 0.5,
+                "critical_path": {"length": 3, "qubits": [0, 1], "gates": {"measure": 2}},
+                "interaction": {
+                    "edges": [[0, 1]],
+                    "edge_operations": 1,
+                    "components": 1,
+                    "component_sizes": [2],
+                    "max_component_qubits": 2,
+                    "bridge_edges": 1,
+                    "max_interaction_span": 1,
+                    "two_qubit_depth": 1,
+                    "note": "Structural proxies … not entanglement.",
+                },
+                "estimates": {
+                    "statevector_memory_bytes": {
+                        "value": 64,
+                        "basis": "exact",
+                        "note": "16 bytes x 2^qubits (complex128) …",
+                    },
+                    "runtime_seconds": {
+                        "low": 0.021,
+                        "high": 0.161,
+                        "basis": "estimated",
+                        "note": "log-linear heuristic, band [0.4t, 3t] …",
+                    },
+                    "compute_cost_usd": {
+                        "low": 9e-07,
+                        "high": 5.57e-06,
+                        "basis": "estimated",
+                        "note": "Lambda GB-s pricing …",
+                    },
+                    "recommended_method": {
+                        "value": "matrix_product_state",
+                        "basis": "rule",
+                        "note": "depth <= 40 -> matrix_product_state, else statevector",
+                    },
+                },
+                "warnings": [],
+                "recommendation": {
+                    "method": "matrix_product_state",
+                    "reasons": ["depth 3 <= 40 -> matrix_product_state …"],
+                    "caveats": [],
+                },
+            }
+        },
+    )
+
+    format: CircuitFormat
+    shots: int
+    num_qubits: int
+    num_clbits: int
+    depth: int
+    total_operations: int
+    gate_histogram: dict[str, int]
+    arity: AnalysisArityCounts
+    measurement_count: int
+    parameter_count: int
+    unbound_parameter_names: list[str]
+    executable: bool
+    two_qubit_density: float
+    critical_path: AnalysisCriticalPath
+    interaction: AnalysisInteraction
+    estimates: AnalysisEstimates
+    warnings: list[AnalysisWarning]
+    recommendation: AnalysisRecommendation
 
 
 # --------------------------------------------------------------------------------------
@@ -466,6 +726,34 @@ def extract_qubit_count(circuit_data: str | dict[str, Any], fmt: CircuitFormat) 
     return observed
 
 
+def _count_cirq_qubits(source: dict[str, Any]) -> int:
+    """Count distinct qubits referenced anywhere in a deserialised cirq document.
+
+    Cirq serialises qubit identities deterministically — equal qubits render
+    byte-identical JSON — so deduplicating canonicalised ``qubits`` entries is
+    exact for the standard qubit types. The walk is recursive, which covers
+    nested sub-circuits (``CircuitOperation``) and tag wrappers.
+    """
+    seen: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("qubits", "qubit"):
+                entries = node.get(key)
+                candidates = entries if isinstance(entries, list) else [entries]
+                for candidate in candidates:
+                    if isinstance(candidate, dict):
+                        seen.add(json.dumps(candidate, sort_keys=True, separators=(",", ":")))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(source)
+    return len(seen)
+
+
 def _observe_qubit_count(circuit_data: str | dict[str, Any], fmt: CircuitFormat) -> int:
     """Count declared qubits without applying the limit (internal helper)."""
     if fmt is CircuitFormat.QASM3:
@@ -501,6 +789,28 @@ def _observe_qubit_count(circuit_data: str | dict[str, Any], fmt: CircuitFormat)
         return int(circuit_data["qubits"])
     if isinstance(circuit_data.get("qubits"), list):
         return len(circuit_data["qubits"])
+
+    # No declared width: for cirq, count the qubits the document itself
+    # references (bare ``cirq.to_json`` output, or an envelope whose
+    # 'circuit' field was omitted from the declared-key shortcuts above).
+    if fmt is CircuitFormat.CIRQ_JSON:
+        document: Any = circuit_data.get("circuit")
+        if isinstance(document, str):
+            try:
+                document = json.loads(document)
+            except json.JSONDecodeError:
+                document = None
+        source: Any = document if isinstance(document, dict) else None
+        if source is None and isinstance(circuit_data.get("moments"), list):
+            source = circuit_data
+        if source is not None:
+            count = _count_cirq_qubits(source)
+            if count:
+                return count
+            raise CircuitValidationError(
+                "cirq_json document references no qubits; cannot determine width",
+                code="NO_QUBITS_DECLARED",
+            )
 
     raise CircuitValidationError(
         f"unable to determine qubit count for {fmt.value} payload; "
@@ -612,9 +922,15 @@ def _validate_json_payload(circuit_data: dict[str, Any], fmt: CircuitFormat) -> 
 
     # Cirq documents are validated against a permissive but bounded shape; the
     # authoritative gate allowlist is re-applied by the worker-side translator.
-    if not any(key in circuit_data for key in ("circuit", "qubits", "num_qubits", "n_qubits")):
+    # Both wire shapes are accepted: the bare output of ``cirq.to_json()``
+    # (``{"cirq_type": "Circuit", "moments": [...]}``) and an envelope such as
+    # ``{"num_qubits": N, "circuit": <document-or-json-string>}``.
+    if not any(
+        key in circuit_data for key in ("circuit", "qubits", "num_qubits", "n_qubits", "moments")
+    ):
         raise CircuitValidationError(
-            "cirq_json payload must contain a 'circuit' or 'qubits' field",
+            "cirq_json payload must be a cirq document (top-level 'moments') "
+            "or an envelope carrying 'circuit', 'qubits' or 'num_qubits'",
             code="JSON_SCHEMA_VIOLATION",
         )
 

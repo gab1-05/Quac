@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import (
     BELL_QASM3,
@@ -22,6 +24,26 @@ from api.schemas import (
     SimulationRequest,
     validate_circuit_payload,
 )
+
+
+def _cirq_op(*xs: int) -> dict:
+    """One GateOperation over the given LineQubits (firewall-shaped only)."""
+    return {
+        "cirq_type": "GateOperation",
+        "gate": {"cirq_type": "HPowGate", "exponent": 1.0},
+        "qubits": [{"cirq_type": "LineQubit", "x": x} for x in xs],
+    }
+
+
+def _cirq_bell_document() -> dict:
+    """Bare ``cirq.to_json`` shape for a 2-qubit circuit (q0 touched twice)."""
+    return {
+        "cirq_type": "Circuit",
+        "moments": [
+            {"cirq_type": "Moment", "operations": [_cirq_op(0)]},
+            {"cirq_type": "Moment", "operations": [_cirq_op(0, 1)]},
+        ],
+    }
 
 # --------------------------------------------------------------------------------------
 # Accept path
@@ -56,6 +78,19 @@ class TestFirewallAccepts:
         payload = {"num_qubits": 4, "circuit": {"some": "cirq document"}}
         assert validate_circuit_payload(payload, CircuitFormat.CIRQ_JSON) == 4
 
+    def test_cirq_json_bare_document_qubit_count(self) -> None:
+        # Bare cirq.to_json() output: no envelope, no declared width — the
+        # width is counted from the qubits the document actually references.
+        assert validate_circuit_payload(_cirq_bell_document(), CircuitFormat.CIRQ_JSON) == 2
+
+    def test_cirq_json_envelope_counts_from_document_when_undeclared(self) -> None:
+        document = _cirq_bell_document()
+        assert validate_circuit_payload({"circuit": document}, CircuitFormat.CIRQ_JSON) == 2
+        assert (
+            validate_circuit_payload({"circuit": json.dumps(document)}, CircuitFormat.CIRQ_JSON)
+            == 2
+        )
+
 
 # --------------------------------------------------------------------------------------
 # Qubit cost firewall (28-qubit ceiling)
@@ -78,6 +113,18 @@ class TestQubitCostFirewall:
         payload = {"num_qubits": 40, "instructions": [{"name": "h", "qubits": [0]}]}
         with pytest.raises(QubitLimitExceededError):
             validate_circuit_payload(payload, CircuitFormat.QISKIT_JSON)
+
+    def test_cirq_json_bare_document_enforces_cap_from_reality(self) -> None:
+        # No declared width to lie about: the cap is applied to the width the
+        # document itself declares by referencing 30 distinct qubits.
+        document = {
+            "cirq_type": "Circuit",
+            "moments": [{"cirq_type": "Moment", "operations": [_cirq_op(*range(30))]}],
+        }
+        with pytest.raises(QubitLimitExceededError) as excinfo:
+            validate_circuit_payload(document, CircuitFormat.CIRQ_JSON)
+        assert excinfo.value.observed == 30
+        assert excinfo.value.limit == MAX_QUBITS
 
 
 # --------------------------------------------------------------------------------------
@@ -150,6 +197,20 @@ class TestFirewallRejects:
         with pytest.raises(CircuitValidationError) as excinfo:
             validate_circuit_payload(nested, CircuitFormat.QISKIT_JSON)
         assert excinfo.value.code == "PAYLOAD_TOO_DEEP"
+
+    def test_cirq_json_unknown_shape_rejected(self) -> None:
+        with pytest.raises(CircuitValidationError) as excinfo:
+            validate_circuit_payload(
+                {"cirq_type": "HPowGate", "exponent": 1.0}, CircuitFormat.CIRQ_JSON
+            )
+        assert excinfo.value.code == "JSON_SCHEMA_VIOLATION"
+
+    def test_cirq_json_qubitless_document_rejected(self) -> None:
+        with pytest.raises(CircuitValidationError) as excinfo:
+            validate_circuit_payload(
+                {"cirq_type": "Circuit", "moments": []}, CircuitFormat.CIRQ_JSON
+            )
+        assert excinfo.value.code == "NO_QUBITS_DECLARED"
 
 
 # --------------------------------------------------------------------------------------

@@ -5,6 +5,9 @@ Endpoints
 * ``POST /v1/quantum/simulate`` — validate a circuit through the firewall,
   persist a job record, enqueue it onto the SQS FIFO queue and answer with
   ``202 Accepted`` plus a fresh UUIDv4 ``job_id``.
+* ``POST /v1/quantum/analyze`` — synchronous pre-flight analysis (exact
+  metrics, labelled estimates, warnings, backend recommendation) with zero
+  side effects: nothing is persisted or enqueued.
 * ``GET  /v1/quantum/jobs/{job_id}`` — job tracking, guarded by a global
   sliding-window rate limiter shared across every route in the process.
 * ``GET  /v1/quantum/jobs/{job_id}/result`` — terminal-state result payload
@@ -38,6 +41,8 @@ from fastapi.responses import JSONResponse
 
 from . import __version__, database, queue_service, results_service
 from .schemas import (
+    AnalysisRequest,
+    CircuitAnalysisResponse,
     CircuitFormat,
     CircuitValidationError,
     JobCancelResponse,
@@ -182,10 +187,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Quac — Quantum Simulation MaaS API",
     description=(
-        "Serverless Quantum Simulation Model-as-a-Service. Submit OpenQASM 3.0 "
-        "or serialized Qiskit/Cirq circuits for asynchronous execution and "
-        "receive signed result callbacks via webhook — or fetch results "
-        "directly from the result endpoint."
+        "Serverless Quantum Simulation Model-as-a-Service. Analyze circuits "
+        "pre-flight (exact metrics, labelled estimates, backend recommendation), "
+        "then submit OpenQASM 3.0 or serialized Qiskit/Cirq circuits for "
+        "asynchronous execution and receive signed result callbacks via webhook "
+        "— or fetch results directly from the result endpoint."
     ),
     version=__version__,
     lifespan=lifespan,
@@ -196,6 +202,14 @@ app = FastAPI(
                 "Circuit submission, job tracking, result retrieval and cancellation. "
                 "All long-running work is asynchronous: submit returns a job id, "
                 "then poll the tracking endpoint (or receive a webhook)."
+            ),
+        },
+        {
+            "name": "analysis",
+            "description": (
+                "Synchronous pre-flight circuit analysis: exact structural metrics, "
+                "clearly labelled estimates, interaction-graph proxies, warnings and "
+                "the backend recommendation. No job is created."
             ),
         },
         {
@@ -340,6 +354,55 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
         status=JobStatus.QUEUED,
         status_url=f"/v1/quantum/jobs/{job_id}",
     )
+
+
+@app.post(
+    "/v1/quantum/analyze",
+    response_model=CircuitAnalysisResponse,
+    tags=["analysis"],
+    summary="Analyze a circuit before submitting it",
+    dependencies=[Depends(rate_limit)],
+    responses={
+        200: {"description": "Pre-flight analysis report"},
+        422: {"description": "Validation firewall rejection or unparseable circuit"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+async def analyze_circuit(request_body: AnalysisRequest) -> CircuitAnalysisResponse:
+    """Compute the pre-flight report for a circuit — synchronously.
+
+    The firewall runs first (identical rules to simulation ingestion), then
+    the shared ``core`` analyzer derives exact structural metrics, labelled
+    estimates and the backend recommendation. This endpoint has **zero side
+    effects**: no job record, no queue message, no object storage write.
+
+    The qiskit/cirq import is deferred to the first call so process boot and
+    ``/healthz`` stay fast on cold starts.
+    """
+    validate_circuit_payload(request_body.circuit_data, request_body.format)
+
+    # Deferred imports: qiskit/cirq are heavy; keep them off the boot path so
+    # process start and /healthz stay fast on cold starts.
+    from core import analysis as core_analysis
+    from core.circuit import CircuitBuildError
+
+    try:
+        report = await asyncio.to_thread(
+            core_analysis.analyze,
+            request_body.circuit_data,
+            request_body.format.value,
+            request_body.shots,
+        )
+    except CircuitBuildError as exc:
+        # The firewall passed but the parser still refused the payload: a
+        # client-side circuit defect, mapped onto the standard 422 envelope.
+        logger.info("analysis build failed format=%s error=%s", request_body.format.value, exc)
+        raise HTTPException(
+            status_code=HTTP_422,
+            detail={"error": "CIRCUIT_ANALYSIS_FAILED", "message": str(exc)},
+        ) from exc
+
+    return CircuitAnalysisResponse.model_validate(report)
 
 
 async def _fetch_job_record(job_id: str) -> dict[str, Any]:

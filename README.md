@@ -38,16 +38,19 @@ back to consumers through a resilient webhook framework.
 quantum-maas-platform/
 ├── api/                        # Ingestion layer (FastAPI on ECS Fargate)
 │   ├── __init__.py
-│   ├── main.py                 # endpoints, global sliding-window rate limiter
+│   ├── main.py                 # endpoints (simulate/track/result/cancel/analyze), rate limiter
 │   ├── schemas.py              # Pydantic v2 contracts + validation firewall
 │   ├── database.py             # pooled DynamoDB job store (async wrappers)
 │   ├── queue_service.py        # SQS FIFO publisher + dedup-id derivation
 │   ├── requirements.txt
 │   └── Dockerfile.api          # multi-stage, non-root, gunicorn+uvicorn
+├── core/                       # Shared package used by both planes
+│   ├── circuit.py              # format factory: qasm3 / qiskit_json / cirq_json → QuantumCircuit
+│   └── analysis.py             # pre-flight analyzer: exact metrics, basis-labelled estimates
 ├── worker/                     # Compute engine (AWS Lambda container image)
 │   ├── __init__.py
 │   ├── worker.py               # SQS consumer, timers, S3, webhook dispatcher
-│   ├── simulator.py            # qiskit-aer factory + format converters
+│   ├── simulator.py            # qiskit-aer execution; re-exports the core factory/analysis
 │   ├── requirements.txt
 │   └── Dockerfile.worker       # AWS Lambda Python 3.11 base, ARM64/X86_64 wheels
 ├── terraform/                  # AWS provider ~> 5.0 (validated with terraform validate)
@@ -55,7 +58,7 @@ quantum-maas-platform/
 │   ├── variables.tf  outputs.tf
 │   ├── iam.tf                  # PoLP roles scoped to this workspace's ARNs
 │   ├── dynamodb.tf  sqs.tf  s3.tf
-├── tests/                      # pytest suite (94 tests)
+├── tests/                      # pytest suite (170 tests)
 ├── scripts/                    # local end-to-end runtime (LocalStack)
 │   ├── localstack_init.py      # idempotent table/queue/bucket bootstrap
 │   ├── local_worker.py         # long-poll loop invoking the real lambda_handler
@@ -75,7 +78,7 @@ quantum-maas-platform/
 ### Run the test suite
 
 ```bash
-pip install pytest fastapi httpx boto3 qiskit qiskit-aer qiskit-qasm3-import
+pip install pytest fastapi httpx boto3 qiskit qiskit-aer qiskit-qasm3-import cirq-core
 python -m pytest tests -q
 ```
 
@@ -168,13 +171,46 @@ The worker re-checks before executing, discards a result that finalises after
 the cancel (deleting the orphaned artifact) and delivers a
 `simulation.cancelled` callback when a webhook is configured.
 
+### Analyze a circuit (pre-flight)
+
+```bash
+curl -sS -X POST http://localhost:8000/v1/quantum/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"circuit_data": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\nh q[0];\ncx q[0], q[1];\nc = measure q;\n", "format": "qasm3", "shots": 1024}'
+```
+
+Returns the full pre-flight report **synchronously, with zero side effects** —
+no job record, no queue message, no object-storage write. The exact same
+validation firewall runs first, so every rejection code (`422 QUBIT_LIMIT_EXCEEDED`,
+`422 JSON_SCHEMA_VIOLATION`, `422 NO_QUBITS_DECLARED`, …) matches simulation
+ingestion.
+
+Verified values for the Bell circuit above: `shots: 1024`, `depth: 3`,
+`gate_histogram: {"h": 1, "cx": 1, "measure": 2}`,
+`estimates.statevector_memory_bytes: {value: 64, basis: "exact"}`,
+`recommendation.method: "matrix_product_state"`, `warnings: []`.
+
+**Methodology** — every number carries a `basis` label so nothing is
+misrepresented:
+
+* `exact` — computed directly from the parsed circuit (depth, histogram,
+  interaction/critical-path proxies, `16 B × 2^qubits` statevector memory);
+* `estimated` — documented heuristics with the formula in the `note` field
+  (runtime band, cost uses the verified AWS Lambda us-east-1 x86 price of
+  `$0.0000166667/GB-s` + `$0.20/1M requests` at the worker's 2 GB memory);
+* `rule` — deterministic selection logic shared verbatim with the worker
+  (depth threshold → MPS vs dense statevector).
+
+Entanglement is **not** computed; the `interaction` block reports structural
+graph proxies only.
+
 ### Supported formats
 
 | `format`      | `circuit_data` shape                                   | Converter                                            |
 |---------------|--------------------------------------------------------|------------------------------------------------------|
 | `qasm3`       | OpenQASM source string                                 | `qiskit.qasm3.loads` (v3) / `from_qasm_str` (v2)      |
 | `qiskit_json` | `{"qasm": ...}` or `{"num_qubits": N, "instructions": [...]}` | QASM passthrough / generic instruction builder |
-| `cirq_json`   | Cirq JSON document                                     | strict gate-allowlist translator → Qiskit            |
+| `cirq_json`   | bare `cirq.to_json()` document (`{"cirq_type": "Circuit", "moments": [...]}`) **or** envelope `{"num_qubits": N, "circuit": <document-or-json-string>}` | strict gate-allowlist translator → Qiskit            |
 
 ---
 
@@ -294,6 +330,9 @@ so rejected payloads have zero infrastructure footprint (verified by tests):
   `launch_missiles q[0];` is rejected at ingest, not by the parser);
 * **28-qubit cost firewall**: `qubit[29] …` → `422 QUBIT_LIMIT_EXCEEDED`
   instantly (2²⁸ complex128 amplitudes ≈ 4 GiB; the wall prevents the bill).
+  For `cirq_json` the width is counted from the distinct qubits the document
+  actually references, so a bare `cirq.to_json()` payload is capped by
+  reality, not by a declared field.
 
 ### 3 · Graceful timeout deflections
 
@@ -386,17 +425,19 @@ python -m pytest tests -q
 
 | File                            | Covers                                                            |
 |---------------------------------|-------------------------------------------------------------------|
-| `test_schemas_firewall.py`      | allow/deny matrix, injection vectors, 28-qubit cap, Pydantic contract |
+| `test_schemas_firewall.py`      | allow/deny matrix, injection vectors, 28-qubit cap (incl. cirq width from bare documents), Pydantic contract |
 | `test_queue_dedup.py`           | dedup-id determinism/precedence, envelope round-trip              |
 | `test_api_endpoints.py`         | 202 flow, 404s, rate-limit 429 + `Retry-After`, no-side-effect rejections |
 | `test_job_results_cancel.py`    | optional webhook, result readiness/artifact mapping, cancel transitions |
 | `test_database_records.py`      | record shape (owner/schema), conditional cancel + guarded updates |
+| `test_analysis.py`              | exact metrics, basis labels, warnings, cross-format parity (qasm3/qiskit_json/cirq_json), worker method parity, analyze endpoint contract, cirq translator correction |
 | `test_simulator_factory.py`     | format converters, MPS-vs-statevector selection, Aer execution    |
 | `test_worker_webhook.py`        | 3-attempt backoff, HMAC signing, SIGALRM budget, batch reporting  |
 | `test_worker_cancellation.py`   | pre-execution cancel/duplicate guards, finalisation race, acks    |
 
 Qiskit-dependent modules skip cleanly (`pytest.importorskip`) when
-`qiskit-aer` is absent; SIGALRM tests skip on non-POSIX hosts (Lambda is Linux).
+`qiskit-aer` is absent, cirq tests skip when `cirq-core` is absent, and
+SIGALRM tests skip on non-POSIX hosts (Lambda is Linux).
 
 ## Security posture at a glance
 

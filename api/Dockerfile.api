@@ -48,6 +48,9 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=quac:quac api/ /app/api/
+# Shared business logic (circuit factory + pre-flight analyzer) imported by
+# api.main as `core.*`; keep it a sibling of the api/ package.
+COPY --chown=quac:quac core/ /app/core/
 
 WORKDIR /app
 

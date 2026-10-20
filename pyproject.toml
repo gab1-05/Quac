@@ -40,7 +40,7 @@ python_version = "3.11"
 # Quac deploys exclusively to Linux (Lambda container + Fargate); target the
 # production platform so POSIX-only APIs (signal.SIGALRM, setitimer) typecheck.
 platform = "linux"
-files = ["api", "worker"]
+files = ["api", "core", "worker"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -58,5 +58,6 @@ testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = [
     "error::DeprecationWarning:api.*",
+    "error::DeprecationWarning:core.*",
     "error::DeprecationWarning:worker.*",
 ]

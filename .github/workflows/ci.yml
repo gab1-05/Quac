@@ -46,7 +46,7 @@ jobs:
           pip install ruff mypy pytest
 
       - name: Ruff
-        run: ruff check api worker tests scripts
+        run: ruff check api core worker tests scripts
 
       - name: Gitleaks (secret scan)
         run: |

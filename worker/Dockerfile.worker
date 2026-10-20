@@ -66,8 +66,13 @@ RUN set -eux; \
          && python -m pip install --no-cache-dir -r "${LAMBDA_TASK_ROOT}/requirements.txt" )
 
 COPY worker/ ${LAMBDA_TASK_ROOT}/worker/
+# Shared business logic (circuit factory + method-selection rule) imported by
+# worker.simulator as `core.*`; keep it a sibling of the worker/ package.
+COPY core/ ${LAMBDA_TASK_ROOT}/core/
 
 # LAMBDA_TASK_ROOT layout expected by the handler string "worker.lambda_handler":
+#   /var/task/core/circuit.py        <- format factory (shared with the API)
+#   /var/task/core/analysis.py       <- metrics + method-selection rule
 #   /var/task/worker/__init__.py
 #   /var/task/worker/worker.py      <- lambda_handler
 #   /var/task/worker/simulator.py   <- heavy qiskit-aer imports (init phase)
