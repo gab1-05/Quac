@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import subprocess
+import warnings
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -265,7 +266,14 @@ def clifford_refusal(circuit: QuantumCircuit) -> str | None:
         operation = instruction.operation
         name = operation.name
 
-        if getattr(operation, "condition", None) is not None:
+        # ``Instruction.condition`` was deprecated in qiskit 1.3 and removed in
+        # 2.x. On 1.x the mere *access* emits a DeprecationWarning (fatal under
+        # pytest's filterwarnings=error), so the probe is warning-suppressed;
+        # on 2.x the attribute is gone and getattr returns the default.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            conditioned = getattr(operation, "condition", None)
+        if conditioned is not None:
             return f"operation #{index} '{name}' is classically conditioned (not Clifford)"
 
         if name in CLIFFORD_GATES:
