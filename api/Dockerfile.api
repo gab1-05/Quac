@@ -1,0 +1,74 @@
+# =============================================================================
+# Quac API — production container
+# Multi-stage, non-root, Gunicorn-managed Uvicorn workers.
+# =============================================================================
+
+# ---------- Stage 1: builder ----------------------------------------------------
+FROM python:3.11-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Build essentials are only present while wheels are compiled (if a source
+# distribution is ever pulled); they never reach the final runtime image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Pin the dependency set deterministically for reproducible builds.
+COPY api/requirements.txt ./requirements.txt
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
+    && /opt/venv/bin/pip install -r requirements.txt
+
+# ---------- Stage 2: runtime ----------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    WEB_CONCURRENCY=4 \
+    QUAC_LOG_LEVEL=INFO
+
+# Minimal OS footprint: no compilers, no package index, CA certs only.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 quac \
+    && useradd --uid 10001 --gid quac --shell /usr/sbin/nologin --create-home quac
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=quac:quac api/ /app/api/
+
+WORKDIR /app
+
+# Drop to a non-root principal before any application code executes.
+USER quac
+
+EXPOSE 8000
+
+# Gunicorn supervises Uvicorn's async worker class; WEB_CONCURRENCY scales
+# concurrent connections horizontally inside the task.
+CMD ["sh", "-c", "exec gunicorn 'api.main:app' \
+      --worker-class uvicorn.workers.UvicornWorker \
+      --workers \"${WEB_CONCURRENCY}\" \
+      --bind 0.0.0.0:8000 \
+      --timeout 60 \
+      --graceful-timeout 30 \
+      --keep-alive 5 \
+      --access-logfile - \
+      --error-logfile - \
+      --capture-output"]
+
+# Container-level liveness probe (ECS/ALB target group points at /healthz).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1

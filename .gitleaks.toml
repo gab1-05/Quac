@@ -1,0 +1,17 @@
+# Gitleaks configuration for the Quac repository.
+#
+# The project has one recurring false positive: the example `idempotency_key`
+# UUIDv4 that appears in the API docs example (api/schemas.py json_schema_extra)
+# and mirrored in README.md. It is a fixed, well-known documentation placeholder
+# — not a live credential — and is explicitly allow-listed below so the secret
+# scan stays signal-only.
+
+[allowlist]
+description = "Quac documented example idempotency key + test scaffolding"
+regexes = [
+  '''0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0''',
+]
+paths = [
+  '''api/schemas\.py''',
+  '''README\.md''',
+]

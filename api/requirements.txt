@@ -1,0 +1,11 @@
+# Quac API runtime dependencies (Python 3.11)
+# fastapi>=0.142 pairs with starlette>=1.0, which is the first starlette line
+# to carry fixes for the PYSEC-2026 DoS advisories against starlette<1.0.1.
+# These pins are the versions the pytest suite runs green against locally.
+fastapi==0.149.0
+starlette==1.9.0
+pydantic==2.13.5
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+boto3==1.35.86
+botocore==1.35.86

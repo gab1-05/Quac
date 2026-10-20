@@ -1,0 +1,144 @@
+# =============================================================================
+# Quac — local end-to-end environment
+#
+# Topology (mirrors production, swapped onto LocalStack):
+#   e2e script -> API (FastAPI) -> LocalStack DynamoDB + SQS FIFO
+#                                     -> worker runner (invokes worker.lambda_handler)
+#                                     -> LocalStack S3 + webhook receiver
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose run --rm init        # idempotent: table, queues, bucket
+#   docker compose run --rm e2e         # submit + poll + verify the full path
+#   docker compose logs -f webhook      # watch signed callbacks arrive
+# =============================================================================
+
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,dynamodb,s3
+      DEBUG: "0"
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  init:
+    image: python:3.11-slim
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment: &aws-env
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ENDPOINT_URL_SQS: http://localstack:4566
+      AWS_ENDPOINT_URL_DYNAMODB: http://localstack:4566
+      AWS_ENDPOINT_URL_S3: http://localstack:4566
+      QUAC_JOBS_TABLE: quac-jobs
+      QUAC_QUEUE_URL: http://localstack:4566/000000000000/quac-jobs.fifo
+      QUAC_RESULTS_BUCKET: quac-results
+      QUAC_AWS_REGION: us-east-1
+      QUAC_WEBHOOK_SECRET: local-dev-secret
+      QUAC_LOG_LEVEL: INFO
+    volumes:
+      - ./scripts:/scripts:ro
+    command: >
+      sh -c "pip install --quiet boto3 &&
+             python /scripts/localstack_init.py"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ENDPOINT_URL_SQS: http://localstack:4566
+      AWS_ENDPOINT_URL_DYNAMODB: http://localstack:4566
+      AWS_ENDPOINT_URL_S3: http://localstack:4566
+      QUAC_JOBS_TABLE: quac-jobs
+      QUAC_QUEUE_URL: http://localstack:4566/000000000000/quac-jobs.fifo
+      QUAC_AWS_REGION: us-east-1
+      QUAC_LOG_LEVEL: INFO
+      WEB_CONCURRENCY: "2"
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile.worker
+    # Override the Lambda CMD *and* entrypoint: /lambda-entrypoint.sh exists to
+    # turn CMD strings into RIC handler invocations, which would mangle a local
+    # long-poll loop. Pinning the entrypoint to sh gives plain runner semantics.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["python /scripts/local_worker.py"]
+    environment: *aws-env
+    volumes:
+      - ./scripts:/scripts:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  webhook:
+    image: python:3.11-slim
+    ports:
+      - "9099:9099"
+    environment:
+      QUAC_WEBHOOK_SECRET: local-dev-secret
+      QUAC_WEBHOOK_PORT: "9099"
+    volumes:
+      - ./scripts:/scripts:ro
+    command: >
+      sh -c "python /scripts/webhook_receiver.py"
+    restart: unless-stopped
+
+  e2e:
+    image: python:3.11-slim
+    profiles: ["tools"]
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ENDPOINT_URL_SQS: http://localstack:4566
+      AWS_ENDPOINT_URL_DYNAMODB: http://localstack:4566
+      AWS_ENDPOINT_URL_S3: http://localstack:4566
+      QUAC_JOBS_TABLE: quac-jobs
+      QUAC_RESULTS_BUCKET: quac-results
+      QUAC_API_BASE: http://api:8000
+      QUAC_WEBHOOK_URL: http://webhook:9099/hook
+      QUAC_WEBHOOK_SINK: http://webhook:9099
+      QUAC_WEBHOOK_SECRET: local-dev-secret
+    volumes:
+      - ./scripts:/scripts:ro
+    working_dir: /app
+    command: >
+      sh -c "pip install --quiet boto3 httpx &&
+             python /scripts/e2e.py"
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started
+
+volumes:
+  localstack-data:

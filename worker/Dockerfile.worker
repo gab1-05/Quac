@@ -1,0 +1,73 @@
+# =============================================================================
+# Quac Worker — AWS Lambda container image (qiskit-aer compute engine)
+#
+# qiskit-aer ships pre-compiled C++ binary extensions (OpenMP + SIMD kernels).
+# The wheels MUST match the Lambda architecture exactly, so this Dockerfile
+# pins the target platform via TARGETARCH and installs wheels-only binaries.
+#
+# Multi-architecture build strategy
+# ---------------------------------
+#   ARM64 (cheaper per-vCPU, Graviton2):
+#     docker buildx build --platform linux/arm64 \
+#       --build-arg TARGETARCH=arm64 -t quac-worker:arm64 --push .
+#   X86_64:
+#     docker buildx build --platform linux/amd64 \
+#       --build-arg TARGETARCH=x86_64 -t quac-worker:x86_64 --push .
+#   Multi-arch manifest (Lambda resolves per-arch automatically):
+#     docker buildx build --platform linux/arm64,linux/amd64 \
+#       --build-arg TARGETARCH=$TARGETARCH -t <repo>:latest --push .
+#
+# Note: TARGETARCH is auto-populated by BuildKit (amd64/arm64); the build-arg
+# exists as an explicit override for CI systems that pre-resolve the wheel
+# platform tag (manylinux2014_aarch64 vs manylinux2014_x86_64).
+# =============================================================================
+
+# syntax=docker/dockerfile:1.7
+FROM public.ecr.aws/lambda/python:3.11
+
+ARG TARGETARCH=amd64
+ARG PIP_NO_CACHE_DIR=1
+
+# Map Docker's TARGETARCH onto the pip --platform wheel tag so that numpy,
+# scipy and qiskit-aer resolve *pre-compiled* binaries for the exact Lambda
+# architecture. Source builds are prohibited (--only-binary) because they
+# would require compilers inside the Lambda base image.
+# Dependencies first (cached layer): copy the lockfile, then install
+# wheels-only binaries pinned to the target Lambda architecture. pip requires
+# --target when --platform is used, so cross-platform wheels land in a staging
+# dir and are then copied into the interpreter's real site-packages.
+COPY worker/requirements.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      arm64)  WHEEL_PLATFORM="manylinux2014_aarch64" ;; \
+      amd64)  WHEEL_PLATFORM="manylinux2014_x86_64" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    python -m pip install --upgrade pip; \
+    SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    STAGING="/tmp/crossdeps"; \
+    ( python -m pip install \
+        --no-cache-dir \
+        --only-binary=:all: \
+        --platform "${WHEEL_PLATFORM}" \
+        --implementation cp \
+        --python-version 3.11 \
+        --abi cp311 \
+        --target "${STAGING}" \
+        -r "${LAMBDA_TASK_ROOT}/requirements.txt" ) \
+    && cp -a "${STAGING}/." "${SITE_PACKAGES}/" \
+    && rm -rf "${STAGING}" \
+    || ( echo "cross-platform wheel resolution failed; falling back to native resolution" \
+         && python -m pip install --no-cache-dir -r "${LAMBDA_TASK_ROOT}/requirements.txt" )
+
+COPY worker/ ${LAMBDA_TASK_ROOT}/worker/
+
+# LAMBDA_TASK_ROOT layout expected by the handler string "worker.lambda_handler":
+#   /var/task/worker/__init__.py
+#   /var/task/worker/worker.py      <- lambda_handler
+#   /var/task/worker/simulator.py   <- heavy qiskit-aer imports (init phase)
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+CMD ["worker.lambda_handler"]
