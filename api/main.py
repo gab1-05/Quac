@@ -539,6 +539,10 @@ async def get_job_result(job_id: str) -> JobResultResponse:
             counts={str(k): int(v) for k, v in dict(document["counts"]).items()},
             most_frequent=document.get("most_frequent"),
             method=str(document.get("method", "unknown")),
+            backend=str(document.get("backend", "")),
+            selection_reasons=[
+                str(reason) for reason in (document.get("selection_reasons") or [])
+            ],
             num_qubits=int(document.get("num_qubits", 0)),
             depth=int(document.get("depth", 0)),
             simulation_time_ms=document.get("simulation_time_ms"),

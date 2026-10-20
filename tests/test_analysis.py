@@ -43,6 +43,9 @@ NO_MEASURE_QASM3 = (
     "h q[0];\ncx q[0], q[1];\ncz q[2], q[3];\n"
 )
 WIDE_QASM3 = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[27] q;\nh q[0];\n"
+WIDE_NONCLIFFORD_QASM3 = (
+    "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[27] q;\nry(0.3) q[0];\n"
+)
 
 
 class TestBellExactMetrics:
@@ -79,9 +82,16 @@ class TestBellExactMetrics:
     def test_bell_warnings_and_recommendation(self, bell_qasm3: str) -> None:
         report = analyze(bell_qasm3, "qasm3", 1024)
         assert report["warnings"] == []
-        assert report["recommendation"]["method"] == "matrix_product_state"
-        assert report["recommendation"]["reasons"]
-        assert report["recommendation"]["caveats"] == []
+        # Bell (h + cx + measure) is entirely Clifford -> P3 selector picks
+        # the exact stabilizer backend and records why.
+        recommendation = report["recommendation"]
+        assert recommendation["backend"] == "stabilizer"
+        assert recommendation["method"] == "stabilizer"
+        assert recommendation["considered"] == ["stabilizer"]
+        assert recommendation["reasons"]
+        assert recommendation["caveats"] == []
+        assert report["backends"]["stabilizer"]["available"] is True
+        assert report["backends"]["statevector"]["max_qubits"] == 16
 
 
 class TestGhzAndGraphProxies:
@@ -127,24 +137,58 @@ class TestEstimateLabels:
 
         method = estimates["recommended_method"]
         assert method["basis"] == "rule"
-        assert method["value"] == "matrix_product_state"
+        assert method["value"] == "stabilizer"
 
     def test_runtime_band_grows_with_width(self, bell_qasm3: str) -> None:
+        # The exponential branch (statevector/MPS): 2^qubits dominates, so a
+        # wide non-Clifford circuit's band must sit above a narrow one's.
+        narrow = analyze(bell_qasm3.replace("h q[0];", "ry(0.3) q[0];"), "qasm3", 1024)
+        wide = analyze(WIDE_NONCLIFFORD_QASM3, "qasm3", 1024)
+        assert narrow["recommendation"]["backend"] == "mps"
+        assert wide["recommendation"]["backend"] == "mps"
+        wide_band = wide["estimates"]["runtime_seconds"]
+        narrow_band = narrow["estimates"]["runtime_seconds"]
+        assert wide_band["low"] > narrow_band["high"]
+
+    def test_stabilizer_band_grows_with_width_but_may_overlap(self, bell_qasm3: str) -> None:
+        # Stabilizer walls are host-overhead-dominated at these sizes (measured
+        # ~0.19s for both 2q and 27q in the pinned worker image), so only the
+        # point estimate is ordered by width — bands may legitimately overlap.
         small = analyze(bell_qasm3, "qasm3", 1024)["estimates"]["runtime_seconds"]
         wide = analyze(WIDE_QASM3, "qasm3", 1024)["estimates"]["runtime_seconds"]
-        assert wide["low"] > small["high"]
+        small_point = (small["low"] + small["high"]) / 2
+        wide_point = (wide["low"] + wide["high"]) / 2
+        assert wide_point > small_point
+        assert 0 < small["low"] <= small["high"]
+        assert 0 < wide["low"] <= wide["high"]
 
     def test_deep_circuit_selects_statevector(self) -> None:
+        # Non-Clifford rotations: the depth rule decides, statevector wins.
+        deep = (
+            "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\n"
+            + "ry(0.3) q[0];\n" * (SHALLOW_DEPTH_THRESHOLD + 1)
+        )
+        report = analyze(deep, "qasm3", 1024)
+        assert report["depth"] == SHALLOW_DEPTH_THRESHOLD + 1
+        assert report["estimates"]["recommended_method"]["value"] == "statevector"
+        assert report["recommendation"]["method"] == "statevector"
+        assert report["recommendation"]["backend"] == "statevector"
+        codes = {warning["code"] for warning in report["warnings"]}
+        assert "DEEP_CIRCUIT_STATEVECTOR" in codes
+
+    def test_deep_clifford_circuit_selects_stabilizer(self) -> None:
+        # Depth alone must not force a dense statevector: an all-Clifford deep
+        # circuit stays on the exact polynomial-cost stabilizer backend.
         deep = (
             "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\n"
             + "h q[0];\n" * (SHALLOW_DEPTH_THRESHOLD + 1)
         )
         report = analyze(deep, "qasm3", 1024)
         assert report["depth"] == SHALLOW_DEPTH_THRESHOLD + 1
-        assert report["estimates"]["recommended_method"]["value"] == "statevector"
-        assert report["recommendation"]["method"] == "statevector"
+        assert report["recommendation"]["backend"] == "stabilizer"
+        assert report["estimates"]["recommended_method"]["value"] == "stabilizer"
         codes = {warning["code"] for warning in report["warnings"]}
-        assert "DEEP_CIRCUIT_STATEVECTOR" in codes
+        assert "DEEP_CIRCUIT_STATEVECTOR" not in codes
 
     def test_near_cap_and_memory_pressure_warnings(self) -> None:
         report = analyze(WIDE_QASM3, "qasm3", 512)
@@ -340,6 +384,9 @@ class TestAnalyzeEndpoint:
         assert body["num_qubits"] == 2
         assert body["depth"] == 3
         assert body["estimates"]["statevector_memory_bytes"]["basis"] == "exact"
+        # P3 contract: the selector's decision + capability matrix ride along.
+        assert body["recommendation"]["backend"] == "stabilizer"
+        assert "gpu_statevector" in body["backends"]
         # Zero side effects: nothing persisted, nothing enqueued.
         assert stubbed_backend["store"] == {}
         assert stubbed_backend["calls"]["create"] == []

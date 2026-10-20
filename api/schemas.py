@@ -266,6 +266,17 @@ class JobResultPayload(BaseModel):
     counts: dict[str, int] = Field(..., description="Measured bitstring histogram.")
     most_frequent: str | None = Field(..., description="Outcome with the highest count.")
     method: str = Field(..., description="Aer simulation method actually used.")
+    backend: str = Field(
+        default="",
+        description=(
+            "Backend the selector executed on: stabilizer | mps | statevector | "
+            "gpu_statevector (empty for documents written before P3)."
+        ),
+    )
+    selection_reasons: list[str] = Field(
+        default_factory=list,
+        description="Human-readable reasons the backend selector recorded.",
+    )
     num_qubits: int
     depth: int
     simulation_time_ms: int | None = Field(
@@ -293,7 +304,13 @@ class JobResultResponse(BaseModel):
                     "shots": 1024,
                     "counts": {"00": 512, "11": 512},
                     "most_frequent": "00",
-                    "method": "matrix_product_state",
+                    "method": "stabilizer",
+                    "backend": "stabilizer",
+                    "selection_reasons": [
+                        "all 4 operations are Clifford (depth 3, 2 qubits) -> "
+                        "stabilizer backend, exact simulation with cost "
+                        "polynomial in circuit size"
+                    ],
                     "num_qubits": 2,
                     "depth": 3,
                     "simulation_time_ms": 842,
@@ -491,13 +508,35 @@ class AnalysisWarning(BaseModel):
 
 
 class AnalysisRecommendation(BaseModel):
-    """Backend recommendation seed (the selector in P3 extends this)."""
+    """The backend selector's decision for this circuit (P3)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    method: str
-    reasons: list[str]
-    caveats: list[str]
+    backend: str = Field(
+        ..., description="Chosen backend: stabilizer | mps | statevector | gpu_statevector."
+    )
+    method: str = Field(..., description="Aer method of the chosen backend.")
+    reasons: list[str] = Field(..., description="Why this backend was chosen, in order.")
+    considered: list[str] = Field(
+        ..., description="Backends the selector evaluated before deciding."
+    )
+    caveats: list[str] = Field(..., description="Risks that come with the choice.")
+
+
+class BackendCapability(BaseModel):
+    """One entry of the platform backend capability matrix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    display_name: str
+    aer_method: str
+    device: Literal["cpu", "gpu"]
+    max_qubits: int
+    requires_clifford: bool
+    note: str
+    available: bool
+    unavailable_reason: str | None = None
 
 
 class CircuitAnalysisResponse(BaseModel):
@@ -539,27 +578,83 @@ class CircuitAnalysisResponse(BaseModel):
                         "note": "16 bytes x 2^qubits (complex128) …",
                     },
                     "runtime_seconds": {
-                        "low": 0.021,
-                        "high": 0.161,
+                        "low": 0.062,
+                        "high": 0.464,
                         "basis": "estimated",
-                        "note": "log-linear heuristic, band [0.4t, 3t] …",
+                        "note": "heuristic band, stabilizer branch …",
                     },
                     "compute_cost_usd": {
-                        "low": 9e-07,
-                        "high": 5.57e-06,
+                        "low": 2.27e-06,
+                        "high": 1.567e-05,
                         "basis": "estimated",
                         "note": "Lambda GB-s pricing …",
                     },
                     "recommended_method": {
-                        "value": "matrix_product_state",
+                        "value": "stabilizer",
                         "basis": "rule",
-                        "note": "depth <= 40 -> matrix_product_state, else statevector",
+                        "note": (
+                            "deterministic selector: Clifford -> stabilizer, "
+                            "width > 16 -> MPS, depth <= 40 -> MPS, else dense "
+                            "statevector (GPU variant when a GPU is detected)"
+                        ),
                     },
                 },
                 "warnings": [],
+                "backends": {
+                    "stabilizer": {
+                        "name": "stabilizer",
+                        "display_name": "Stabilizer tableau simulator",
+                        "aer_method": "stabilizer",
+                        "device": "cpu",
+                        "max_qubits": 28,
+                        "requires_clifford": True,
+                        "note": "Exact Clifford simulation, cost polynomial in circuit size …",
+                        "available": True,
+                        "unavailable_reason": None,
+                    },
+                    "mps": {
+                        "name": "mps",
+                        "display_name": "Matrix-product-state (tensor network) simulator",
+                        "aer_method": "matrix_product_state",
+                        "device": "cpu",
+                        "max_qubits": 28,
+                        "requires_clifford": False,
+                        "note": "Memory grows with bond dimension (entanglement), not width …",
+                        "available": True,
+                        "unavailable_reason": None,
+                    },
+                    "statevector": {
+                        "name": "statevector",
+                        "display_name": "Dense statevector simulator (CPU)",
+                        "aer_method": "statevector",
+                        "device": "cpu",
+                        "max_qubits": 16,
+                        "requires_clifford": False,
+                        "note": "Exact dense simulation; memory is 16 B x 2^qubits …",
+                        "available": True,
+                        "unavailable_reason": None,
+                    },
+                    "gpu_statevector": {
+                        "name": "gpu_statevector",
+                        "display_name": "Dense statevector simulator (GPU)",
+                        "aer_method": "statevector",
+                        "device": "gpu",
+                        "max_qubits": 16,
+                        "requires_clifford": False,
+                        "note": "Same exact statevector method on an accelerator …",
+                        "available": False,
+                        "unavailable_reason": "GPU disabled (set QUAC_GPU_ENABLED=1 to opt in)",
+                    },
+                },
                 "recommendation": {
-                    "method": "matrix_product_state",
-                    "reasons": ["depth 3 <= 40 -> matrix_product_state …"],
+                    "backend": "stabilizer",
+                    "method": "stabilizer",
+                    "reasons": [
+                        "all 4 operations are Clifford (depth 3, 2 qubits) -> "
+                        "stabilizer backend, exact simulation with cost "
+                        "polynomial in circuit size"
+                    ],
+                    "considered": ["stabilizer"],
                     "caveats": [],
                 },
             }
@@ -583,6 +678,9 @@ class CircuitAnalysisResponse(BaseModel):
     interaction: AnalysisInteraction
     estimates: AnalysisEstimates
     warnings: list[AnalysisWarning]
+    backends: dict[str, BackendCapability] = Field(
+        ..., description="Capability matrix of every backend with live availability."
+    )
     recommendation: AnalysisRecommendation
 
 

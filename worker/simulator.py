@@ -15,18 +15,21 @@ Responsibilities
   / ``cirq_json`` payloads into a ``QuantumCircuit``. The implementation lives
   in :mod:`core.circuit` (shared with the API's pre-flight analyzer so both
   planes parse a payload identically) and is re-exported here.
-* :func:`choose_simulation_method` — depth-driven backend selection
-  (``matrix_product_state`` for shallow circuits, ``statevector`` for dense
-  entanglements). The rule lives in :mod:`core.analysis` and is re-exported.
-* :func:`run_simulation` — transpile + execute + sample counts, with guarded
-  statevector probability extraction for small registers.
+* :func:`select_backend` — the P3 backend selector (stabilizer / MPS /
+  statevector / GPU statevector with human-readable reasons). The selector
+  lives in :mod:`core.backends` and is shared verbatim with the analyzer's
+  recommendation, so the backend shown up-front is the backend that runs.
+* :func:`run_simulation` — select a backend, transpile + execute through the
+  backend registry, sample counts, with guarded statevector probability
+  extraction for small registers.
 
 Back-compat surface
 -------------------
 Historical import paths are preserved: ``worker.simulator.build_circuit``,
 ``worker.simulator.SimulationBuildError`` (alias of
-``core.circuit.CircuitBuildError``) and
-``worker.simulator.choose_simulation_method`` keep working for the worker's
+``core.circuit.CircuitBuildError``),
+``worker.simulator.choose_simulation_method`` (the raw depth rule) and
+``worker.simulator.SHALLOW_DEPTH_THRESHOLD`` keep working for the worker's
 callers and tests.
 """
 
@@ -44,7 +47,14 @@ import numpy as np
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
-from core.analysis import SHALLOW_DEPTH_THRESHOLD, choose_simulation_method
+from core.backends import SHALLOW_DEPTH_THRESHOLD, choose_simulation_method, select_backend
+from core.backends.base import STATEVECTOR_MAX_QUBITS
+from core.backends.classical import (
+    TRANSPILE_OPTIMIZATION_LEVEL,
+    BackendExecutionError,
+    get_backend,
+)
+from core.backends.selector import BackendUnavailableError
 from core.circuit import CircuitBuildError, build_circuit
 
 logger = logging.getLogger("quac.worker.simulator")
@@ -56,10 +66,8 @@ SimulationBuildError = CircuitBuildError
 # Tunables
 # --------------------------------------------------------------------------------------
 
-MAX_STATEVECTOR_QUBITS: Final[int] = 16
+MAX_STATEVECTOR_QUBITS: Final[int] = STATEVECTOR_MAX_QUBITS
 """Above this width probability extraction is skipped to bound memory growth."""
-
-TRANSPILE_OPTIMIZATION_LEVEL: Final[int] = 2
 
 
 class SimulationExecutionError(RuntimeError):
@@ -82,6 +90,10 @@ class SimulationResult:
     depth: int
     statevector_probabilities: dict[str, float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    backend: str = ""
+    """Backend name the selector chose (stabilizer | mps | statevector | gpu_statevector)."""
+    selection_reasons: list[str] = field(default_factory=list)
+    """Human-readable selection reasons (empty for documents predating P3)."""
 
     @property
     def most_frequent(self) -> str | None:
@@ -101,6 +113,7 @@ __all__ = [
     "build_circuit",
     "choose_simulation_method",
     "run_simulation",
+    "select_backend",
 ]
 
 
@@ -129,9 +142,29 @@ def _ensure_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
     return prepared
 
 
+_VECTOR_PROBE: tuple[AerSimulator, Any] | None = None
+"""Cached (statevector simulator, transpiler Target) for probability extraction.
+
+Same rationale as ``core.backends.classical.AerBackend._get_simulator``:
+``transpile(circuit, backend)`` re-derives the backend Target on every access
+(~0.8 s fixed overhead per job on the pinned production stack); the simulation
+of small registers itself is milliseconds.
+"""
+
+
+def _get_vector_probe() -> tuple[AerSimulator, Any]:
+    """Build the extraction simulator + Target once per worker process."""
+    global _VECTOR_PROBE
+    if _VECTOR_PROBE is None:
+        simulator = AerSimulator(method="statevector")
+        _VECTOR_PROBE = (simulator, simulator.target)
+    return _VECTOR_PROBE
+
+
 def _extract_statevector_probabilities(circuit: QuantumCircuit) -> dict[str, float] | None:
     """Compute |amplitude|**2 per basis state for small registers only."""
     # remove_final_measurements(inplace=False) *returns* a stripped copy — the
+    # return value must be assigned or save_statevector runs after collapse.
     # return value must be assigned or save_statevector runs after collapse.
     probe = circuit.copy().remove_final_measurements(inplace=False)
     if probe.num_qubits > MAX_STATEVECTOR_QUBITS:
@@ -144,8 +177,10 @@ def _extract_statevector_probabilities(circuit: QuantumCircuit) -> dict[str, flo
 
     try:
         probe.save_statevector()
-        vector_sim = AerSimulator(method="statevector")
-        compiled = transpile(probe, vector_sim, optimization_level=TRANSPILE_OPTIMIZATION_LEVEL)
+        vector_sim, vector_target = _get_vector_probe()
+        compiled = transpile(
+            probe, target=vector_target, optimization_level=TRANSPILE_OPTIMIZATION_LEVEL
+        )
         state = vector_sim.run(compiled, shots=1).result().get_statevector()
         amplitudes = np.asarray(state, dtype=np.complex128)
         probabilities = np.abs(amplitudes) ** 2
@@ -172,15 +207,21 @@ def run_simulation(
     circuit_data: str | dict[str, Any],
     circuit_format: str,
     shots: int,
+    *,
+    backend: str | None = None,
 ) -> SimulationResult:
-    """Build, transpile and execute a circuit on the qiskit-aer backend.
+    """Select a backend, then transpile and execute on the qiskit-aer engine.
+
+    The backend selector runs first (the same one the analyzer recommends),
+    unless ``backend`` names a manual override — overrides are validated
+    against the capability facts and never silently coerced.
 
     Runs synchronously inside the worker's dedicated compute thread; all heavy
     package state was already initialised at module import time.
 
     Raises:
             SimulationBuildError: payload conversion failure.
-            SimulationExecutionError: backend execution failure.
+            SimulationExecutionError: selection refusal or backend failure.
     """
     if shots < 1 or shots > 8192:
         raise SimulationExecutionError(f"shots must be within [1, 8192]; got {shots}")
@@ -188,36 +229,22 @@ def run_simulation(
     circuit = build_circuit(circuit_data, circuit_format)
     measured = _ensure_measurements(circuit)
 
-    method = choose_simulation_method(circuit)
-    # NOTE: optimization_level is a *transpile* parameter, not an Aer backend
-    # option — passing it here raises AerError("Invalid option").
-    simulator = AerSimulator(method=method)
-
     try:
-        compiled = transpile(measured, simulator, optimization_level=TRANSPILE_OPTIMIZATION_LEVEL)
-        job = simulator.run(compiled, shots=shots)
-        aer_result = job.result()
-        raw_counts: dict[str, int] = aer_result.get_counts()
-    except Exception as exc:
-        raise SimulationExecutionError(f"aer execution failure: {exc}") from exc
-
-    counts = {
-        str(bitstring).replace(" ", ""): int(count)
-        for bitstring, count in raw_counts.items()
-    }
-    total = sum(counts.values())
-    if total <= 0:
-        raise SimulationExecutionError("backend returned an empty count distribution")
+        selection = select_backend(circuit, shots=shots, requested_backend=backend)
+        counts = get_backend(selection.backend).execute(measured, shots)
+    except (BackendUnavailableError, BackendExecutionError) as exc:
+        raise SimulationExecutionError(str(exc)) from exc
 
     probabilities = _extract_statevector_probabilities(circuit)
     num_qubits = circuit.num_qubits
     depth = circuit.depth()
 
     logger.info(
-        "simulation finished qubits=%d depth=%d method=%s shots=%d outcomes=%d",
+        "simulation finished qubits=%d depth=%d backend=%s method=%s shots=%d outcomes=%d",
         num_qubits,
         depth,
-        method,
+        selection.backend,
+        selection.method,
         shots,
         len(counts),
     )
@@ -225,7 +252,7 @@ def run_simulation(
     return SimulationResult(
         counts=counts,
         shots=shots,
-        method=method,
+        method=selection.method,
         num_qubits=num_qubits,
         depth=depth,
         statevector_probabilities=probabilities,
@@ -233,5 +260,9 @@ def run_simulation(
             "transpile_optimization_level": TRANSPILE_OPTIMIZATION_LEVEL,
             "shallow_depth_threshold": SHALLOW_DEPTH_THRESHOLD,
             "statevector_extracted": probabilities is not None,
+            "device": selection.device,
+            "considered_backends": selection.considered,
         },
+        backend=selection.backend,
+        selection_reasons=list(selection.reasons),
     )

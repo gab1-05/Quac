@@ -46,11 +46,15 @@ quantum-maas-platform/
 │   └── Dockerfile.api          # multi-stage, non-root, gunicorn+uvicorn
 ├── core/                       # Shared package used by both planes
 │   ├── circuit.py              # format factory: qasm3 / qiskit_json / cirq_json → QuantumCircuit
+│   ├── backends/               # P3 backend layer (pure metadata/logic in base+selector)
+│   │   ├── base.py             # capability matrix, Clifford classifier, GPU probe
+│   │   ├── selector.py         # deterministic backend selection + typed refusals
+│   │   └── classical.py        # Aer implementations (worker-only import)
 │   └── analysis.py             # pre-flight analyzer: exact metrics, basis-labelled estimates
 ├── worker/                     # Compute engine (AWS Lambda container image)
 │   ├── __init__.py
 │   ├── worker.py               # SQS consumer, timers, S3, webhook dispatcher
-│   ├── simulator.py            # qiskit-aer execution; re-exports the core factory/analysis
+│   ├── simulator.py            # qiskit-aer execution via the P3 backend selector/registry
 │   ├── requirements.txt
 │   └── Dockerfile.worker       # AWS Lambda Python 3.11 base, ARM64/X86_64 wheels
 ├── terraform/                  # AWS provider ~> 5.0 (validated with terraform validate)
@@ -58,7 +62,7 @@ quantum-maas-platform/
 │   ├── variables.tf  outputs.tf
 │   ├── iam.tf                  # PoLP roles scoped to this workspace's ARNs
 │   ├── dynamodb.tf  sqs.tf  s3.tf
-├── tests/                      # pytest suite (170 tests)
+├── tests/                      # pytest suite (213 tests)
 ├── scripts/                    # local end-to-end runtime (LocalStack)
 │   ├── localstack_init.py      # idempotent table/queue/bucket bootstrap
 │   ├── local_worker.py         # long-poll loop invoking the real lambda_handler
@@ -148,7 +152,8 @@ curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3
 ```
 
 * `409 JOB_NOT_READY` while the job is still `queued`/`processing`;
-* `200` with `result` (shots, counts, method, depth, timings, reproducibility
+* `200` with `result` (shots, counts, method, backend + selection reasons,
+  depth, timings, reproducibility
   metadata) and a short-lived **pre-signed S3 `download_url`** for the full
   result document (TTL `QUAC_PRESIGNED_TTL`, default 900 s) once `completed`;
 * `200` with `result: null` + `error_message` for `failed`/`cancelled`;
@@ -188,7 +193,9 @@ ingestion.
 Verified values for the Bell circuit above: `shots: 1024`, `depth: 3`,
 `gate_histogram: {"h": 1, "cx": 1, "measure": 2}`,
 `estimates.statevector_memory_bytes: {value: 64, basis: "exact"}`,
-`recommendation.method: "matrix_product_state"`, `warnings: []`.
+`recommendation.backend: "stabilizer"`, `warnings: []` — Bell is entirely
+Clifford, so the selector routes it to the exact polynomial-cost stabilizer
+backend (see [Backend selection](#backend-selection-p3)).
 
 **Methodology** — every number carries a `basis` label so nothing is
 misrepresented:
@@ -198,8 +205,9 @@ misrepresented:
 * `estimated` — documented heuristics with the formula in the `note` field
   (runtime band, cost uses the verified AWS Lambda us-east-1 x86 price of
   `$0.0000166667/GB-s` + `$0.20/1M requests` at the worker's 2 GB memory);
-* `rule` — deterministic selection logic shared verbatim with the worker
-  (depth threshold → MPS vs dense statevector).
+* `rule` — deterministic backend selection shared verbatim with the worker
+  (Clifford → stabilizer, width/memory guards → MPS, depth rule → dense
+  statevector; see below).
 
 Entanglement is **not** computed; the `interaction` block reports structural
 graph proxies only.
@@ -211,6 +219,50 @@ graph proxies only.
 | `qasm3`       | OpenQASM source string                                 | `qiskit.qasm3.loads` (v3) / `from_qasm_str` (v2)      |
 | `qiskit_json` | `{"qasm": ...}` or `{"num_qubits": N, "instructions": [...]}` | QASM passthrough / generic instruction builder |
 | `cirq_json`   | bare `cirq.to_json()` document (`{"cirq_type": "Circuit", "moments": [...]}`) **or** envelope `{"num_qubits": N, "circuit": <document-or-json-string>}` | strict gate-allowlist translator → Qiskit            |
+
+### Backend selection (P3)
+
+Every circuit is routed by a deterministic selector
+(`core/backends/selector.py`) that the analyzer and the worker run verbatim —
+the `recommendation` in the pre-flight report is the backend that will
+execute. Selection reasons, the considered set and any caveats are returned
+with the report **and** persisted on the result document
+(`result.backend`, `result.selection_reasons`).
+
+| Backend         | Aer method             | Device | Max qubits | Clifford-only | When it wins                                            |
+|-----------------|------------------------|--------|------------|---------------|---------------------------------------------------------|
+| `stabilizer`    | `stabilizer`           | cpu    | 28         | yes           | every operation is Clifford (incl. `rx/ry/rz` at k·π/2) |
+| `mps`           | `matrix_product_state` | cpu    | 28         | no            | width > 16, or depth ≤ 40, or statevector memory guard  |
+| `statevector`   | `statevector`          | cpu    | 16         | no            | deep (depth > 40) non-Clifford circuits ≤ 16 qubits     |
+| `gpu_statevector`| `statevector`         | gpu    | 16         | no            | the statevector case when a GPU is detected             |
+
+Rules, in order:
+
+1. **Clifford → stabilizer.** Exact simulation with cost polynomial in circuit
+   size (`qubits² × depth`, never `2^qubits`). Excluded when a noise model is
+   present (Aer's stabilizer method does not support general noise); a deep
+   Clifford circuit therefore still avoids a dense statevector.
+2. **Width guard.** Beyond 16 qubits only MPS survives (dense statevector
+   needs `16 B × 2^qubits`); deep-and-wide circuits carry a bond-dimension
+   caveat.
+3. **Depth rule.** Depth ≤ 40 → MPS (tensor-network memory grows with
+   entanglement, not width); deeper non-Clifford circuits → dense statevector,
+   falling back to MPS when the vector would exceed half the worker memory
+   budget (`QUAC_MEMORY_BUDGET_MB`, default 2048 MiB).
+4. **GPU is opt-in.** `gpu_statevector` is only chosen when
+   `QUAC_GPU_ENABLED=1` **and** `nvidia-smi` lists a device — never on an
+   unverified host.
+
+Manual overrides (`result.backend` via the simulator API) are validated against
+the same capability facts and refuse with a typed, human-readable reason
+(`BackendUnavailableError`); they are never silently coerced to another backend.
+
+The runtime band's stabilizer branch was calibrated against measured
+end-to-end walls inside the pinned production worker image (qiskit 1.4.2 /
+qiskit-aer 0.15.1): Bell 0.197 s, GHZ-10 0.181 s, 27-qubit width 0.196 s,
+300-layer Clifford 0.913 s — all within the reported `[0.4t, 3t]` band. The
+exponential (statevector/MPS) branch remains a worst-case bound that
+overestimates low-entanglement circuits; the `note` field says so.
 
 ---
 
@@ -225,7 +277,11 @@ state:
   "job_id": "…",
   "status": "completed",
   "shots": 1024,
-  "method": "matrix_product_state",
+  "method": "stabilizer",
+  "backend": "stabilizer",
+  "selection_reasons": [
+    "all 4 operations are Clifford (depth 3, 2 qubits) -> stabilizer backend, exact simulation with cost polynomial in circuit size"
+  ],
   "num_qubits": 2,
   "depth": 3,
   "most_frequent": "00",
@@ -430,8 +486,9 @@ python -m pytest tests -q
 | `test_api_endpoints.py`         | 202 flow, 404s, rate-limit 429 + `Retry-After`, no-side-effect rejections |
 | `test_job_results_cancel.py`    | optional webhook, result readiness/artifact mapping, cancel transitions |
 | `test_database_records.py`      | record shape (owner/schema), conditional cancel + guarded updates |
-| `test_analysis.py`              | exact metrics, basis labels, warnings, cross-format parity (qasm3/qiskit_json/cirq_json), worker method parity, analyze endpoint contract, cirq translator correction |
-| `test_simulator_factory.py`     | format converters, MPS-vs-statevector selection, Aer execution    |
+| `test_analysis.py`              | exact metrics, basis labels, warnings, backend recommendation + capability matrix, cross-format parity (qasm3/qiskit_json/cirq_json), worker parity, analyze endpoint contract, cirq translator correction |
+| `test_backends.py`              | P3 selector: Clifford classification matrix, capability/GPU detection, selection reasoning, typed overrides, Aer execution (stabilizer vs statevector agreement) |
+| `test_simulator_factory.py`     | format converters, depth-rule selection, Aer execution via the selected backend |
 | `test_worker_webhook.py`        | 3-attempt backoff, HMAC signing, SIGALRM budget, batch reporting  |
 | `test_worker_cancellation.py`   | pre-execution cancel/duplicate guards, finalisation race, acks    |
 

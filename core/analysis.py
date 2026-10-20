@@ -31,15 +31,21 @@ from typing import Any, Final
 
 from qiskit import QuantumCircuit
 
+from core.backends import (
+    QUBIT_CAP,
+    SHALLOW_DEPTH_THRESHOLD,
+    STATEVECTOR_MAX_QUBITS,
+    capabilities_matrix,
+    choose_simulation_method,
+    select_backend,
+)
 from core.circuit import build_circuit
 
 logger = logging.getLogger("quac.core.analysis")
 
-#: Circuits at or below this gate depth use the MPS (tensor-network) backend.
-#: Moved here from the worker so the analyzer and the worker share one rule.
-SHALLOW_DEPTH_THRESHOLD: Final[int] = 40
-#: Mirrors the API firewall's hard cap (defence in depth if called directly).
-QUBIT_CAP: Final[int] = 28
+#: Selection constants and the depth rule now live in :mod:`core.backends`
+#: (shared with the worker's selector) and are re-exported here so every
+#: historical ``core.analysis`` import path keeps working.
 #: Widths at or above this produce a NEAR_QUBIT_CAP warning.
 NEAR_QUBIT_CAP: Final[int] = 26
 #: complex128 amplitude size used by the exact statevector memory formula.
@@ -48,10 +54,27 @@ STATEVECTOR_BYTES_PER_AMPLITUDE: Final[int] = 16
 MEMORY_WARNING_BYTES: Final[int] = 1 << 30  # 1 GiB
 
 #: Runtime heuristic (see :func:`_estimate_runtime_seconds`).
+#:
+#: Calibration basis (P3): measured end-to-end walls through
+#: ``worker.simulator.run_simulation`` inside the pinned production worker
+#: container (qiskit 1.4.2 / qiskit-aer 0.15.1, linux/amd64), best-of-3, after
+#: the cached-Target transpile fix in ``core.backends.classical``:
+#:   bell2   n=2  d=3    0.197s    ghz10   n=10 d=11   0.181s
+#:   wide27  n=27 d=2    0.196s    deep5   n=5  d=300  0.913s
+#:   shallow2-mps n=2  d=5   0.031s   deep5-sv    n=5  d=303  0.570s
+#: The stabilizer base (0.15 s) absorbs the measured fixed per-job overhead
+#: (parse + transpile + run); the dense/MPS base (0.05 s) is P1's calibration,
+#: unchanged in P3.
 _RUNTIME_FIXED_BASE_SECONDS: Final[float] = 0.05
+_RUNTIME_STABILIZER_BASE_SECONDS: Final[float] = 0.15
 _RUNTIME_PER_DEPTH_LAYER_SECONDS: Final[float] = 0.001
 _RUNTIME_STATEVECTOR_K: Final[float] = 2e-5
 _RUNTIME_MPS_FACTOR: Final[float] = 0.5
+#: Stabilizer branch: tableau updates cost ~qubits^2 per gate layer, never
+#: 2^qubits. K_s = 3e-5 brackets all four measured stabilizer walls above in
+#: the [0.4t, 3t] band (larger K overshoots wide27, smaller K undershoots
+#: bell2's fixed overhead).
+_RUNTIME_STABILIZER_K: Final[float] = 3e-5
 _RUNTIME_SPREAD_LOW: Final[float] = 0.4
 _RUNTIME_SPREAD_HIGH: Final[float] = 3.0
 #: Cap the exponential scale so absurd direct calls cannot overflow floats.
@@ -75,25 +98,9 @@ PROXY_NOTE: Final[str] = (
     "entanglement measure (entropy, concurrence, …) is computed."
 )
 
-
-def choose_simulation_method(circuit: QuantumCircuit) -> str:
-    """Select the Aer simulation method from the circuit's structural shape.
-
-    * Shallow circuits (depth <= :data:`SHALLOW_DEPTH_THRESHOLD`) are simulated
-      with the tensor-network ``matrix_product_state`` method, which exploits
-      limited entanglement spread and keeps memory sub-linear in qubit count.
-    * Deeper, densely entangled circuits fall back to the dense ``statevector``
-      method, where MPS bond dimensions would explode.
-    """
-    depth = circuit.depth()
-    method = "matrix_product_state" if depth <= SHALLOW_DEPTH_THRESHOLD else "statevector"
-    logger.debug(
-        "method selection depth=%d threshold=%d -> %s",
-        depth,
-        SHALLOW_DEPTH_THRESHOLD,
-        method,
-    )
-    return method
+# ``choose_simulation_method`` (the raw depth rule) is imported from
+# core.backends and re-exported below — one definition shared by the analyzer,
+# the selector and the worker.
 
 
 # --------------------------------------------------------------------------------------
@@ -255,18 +262,32 @@ def _estimate_runtime_seconds(
 ) -> tuple[float, float]:
     """Heuristic runtime band in seconds — ``basis: estimated``.
 
-    Point value ``t = fixed + per-layer + K * 2**qubits * (depth + 10) * f``
-    with ``f = 0.5`` (MPS) or ``1.0`` (statevector); the band is ``[0.4t, 3t]``.
-    Calibrated against local Aer CPU runs of reference circuits — this is a
-    planning heuristic, not a benchmark.
+    * Dense statevector / MPS: ``t = fixed + per-layer + K * 2**qubits *
+      (depth + 10) * f`` with ``f = 0.5`` (MPS) or ``1.0`` (statevector).
+    * Stabilizer: ``t = fixed_s + per-layer + K_s * qubits**2 * (depth + 10)`` —
+      tableau updates are polynomial in width, so the exponential term must
+      not apply to Clifford circuits; ``fixed_s`` absorbs the measured
+      per-job host overhead (parse + transpile + run) that dominates small
+      circuits.
+
+    The band is ``[0.4t, 3t]``. Constants are calibrated against measured
+    end-to-end walls in the pinned production worker image (see the constant
+    block above) — planning guidance, not a benchmark.
     """
-    factor = _RUNTIME_MPS_FACTOR if method == "matrix_product_state" else 1.0
-    scale = float(2 ** min(num_qubits, _RUNTIME_QUBIT_SCALE_CAP))
-    point = (
-        _RUNTIME_FIXED_BASE_SECONDS
-        + _RUNTIME_PER_DEPTH_LAYER_SECONDS * depth
-        + _RUNTIME_STATEVECTOR_K * scale * (depth + 10) * factor
-    )
+    if method == "stabilizer":
+        point = (
+            _RUNTIME_STABILIZER_BASE_SECONDS
+            + _RUNTIME_PER_DEPTH_LAYER_SECONDS * depth
+            + _RUNTIME_STABILIZER_K * float(num_qubits**2) * (depth + 10)
+        )
+    else:
+        factor = _RUNTIME_MPS_FACTOR if method == "matrix_product_state" else 1.0
+        scale = float(2 ** min(num_qubits, _RUNTIME_QUBIT_SCALE_CAP))
+        point = (
+            _RUNTIME_FIXED_BASE_SECONDS
+            + _RUNTIME_PER_DEPTH_LAYER_SECONDS * depth
+            + _RUNTIME_STATEVECTOR_K * scale * (depth + 10) * factor
+        )
     return round(max(point * _RUNTIME_SPREAD_LOW, 0.01), 3), round(
         point * _RUNTIME_SPREAD_HIGH, 3
     )
@@ -326,7 +347,8 @@ def analyze_quantum_circuit(circuit: QuantumCircuit, shots: int) -> dict[str, An
     active = {index for _, _, indices in layered for index in indices}
     unused_qubits = sum(1 for qubit in range(num_qubits) if qubit not in active)
     cancellations = _count_cancellations(layered)
-    method = choose_simulation_method(circuit)
+    selection = select_backend(circuit, shots=shots)
+    method = selection.method
 
     statevector_bytes = STATEVECTOR_BYTES_PER_AMPLITUDE * (2**num_qubits)
     runtime_low, runtime_high = _estimate_runtime_seconds(num_qubits, depth, method)
@@ -392,7 +414,7 @@ def analyze_quantum_circuit(circuit: QuantumCircuit, shots: int) -> dict[str, An
                 ),
             }
         )
-    if depth > SHALLOW_DEPTH_THRESHOLD:
+    if depth > SHALLOW_DEPTH_THRESHOLD and method == "statevector":
         warnings.append(
             {
                 "code": "DEEP_CIRCUIT_STATEVECTOR",
@@ -427,18 +449,9 @@ def analyze_quantum_circuit(circuit: QuantumCircuit, shots: int) -> dict[str, An
             }
         )
 
-    reasons: list[str] = []
-    if method == "matrix_product_state":
-        reasons.append(
-            f"depth {depth} <= {SHALLOW_DEPTH_THRESHOLD} -> matrix_product_state "
-            "(tensor-network memory grows sub-linearly with qubit count)"
-        )
-    else:
-        reasons.append(
-            f"depth {depth} > {SHALLOW_DEPTH_THRESHOLD} -> statevector "
-            "(MPS bond dimensions would explode on deep circuits)"
-        )
+    reasons: list[str] = list(selection.reasons)
     caveats = [w["message"] for w in warnings if w["severity"] == "warning"]
+    caveats.extend(selection.caveats)
 
     logger.info(
         "analysis complete qubits=%d depth=%d shots=%d warnings=%d",
@@ -485,10 +498,15 @@ def analyze_quantum_circuit(circuit: QuantumCircuit, shots: int) -> dict[str, An
                 "high": runtime_high,
                 "basis": "estimated",
                 "note": (
-                    "log-linear heuristic t = 0.05 + 0.001*depth + "
-                    "2e-5*2^qubits*(depth+10)*method-factor, band = [0.4t, 3t]; "
-                    "calibrated against local Aer CPU runs — planning guidance, "
-                    "not a benchmark"
+                    "heuristic t = per-job base (0.15 s stabilizer, 0.05 s "
+                    "statevector/MPS) + 0.001*depth + method term "
+                    "(2e-5*2^qubits*(depth+10)*factor for statevector/MPS, "
+                    "3e-5*qubits^2*(depth+10) for the polynomial stabilizer "
+                    "branch), band = [0.4t, 3t]; stabilizer constants measured "
+                    "end-to-end in the pinned production worker image, the "
+                    "exponential branch is a worst-case bound that overestimates "
+                    "low-entanglement circuits — planning guidance, not a "
+                    "benchmark"
                 ),
             },
             "compute_cost_usd": {
@@ -506,15 +524,20 @@ def analyze_quantum_circuit(circuit: QuantumCircuit, shots: int) -> dict[str, An
                 "value": method,
                 "basis": "rule",
                 "note": (
-                    f"depth <= {SHALLOW_DEPTH_THRESHOLD} -> matrix_product_state, "
-                    "else statevector"
+                    "deterministic selector: Clifford -> stabilizer, "
+                    f"width > {STATEVECTOR_MAX_QUBITS} -> MPS, "
+                    f"depth <= {SHALLOW_DEPTH_THRESHOLD} -> MPS, else dense "
+                    "statevector (GPU variant when a GPU is detected)"
                 ),
             },
         },
         "warnings": warnings,
+        "backends": capabilities_matrix(),
         "recommendation": {
+            "backend": selection.backend,
             "method": method,
             "reasons": reasons,
+            "considered": selection.considered,
             "caveats": caveats,
         },
     }

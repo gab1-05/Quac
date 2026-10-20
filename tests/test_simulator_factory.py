@@ -25,11 +25,16 @@ from worker.simulator import (
 
 
 def _deep_circuit(qubits: int = 3, rounds: int = 30) -> QuantumCircuit:
-    """Build a circuit whose gate depth exceeds SHALLOW_DEPTH_THRESHOLD."""
+    """Build a circuit whose gate depth exceeds SHALLOW_DEPTH_THRESHOLD.
+
+    ``ry`` rotations at a non-Clifford angle keep the circuit outside the
+    stabilizer group, so the *depth rule under test* is what selects the
+    backend — not the Clifford shortcut (P3).
+    """
     circuit = QuantumCircuit(qubits)
     for _ in range(rounds):
         for target in range(qubits):
-            circuit.h(target)
+            circuit.ry(0.3 + 0.07 * target, target)
         for target in range(qubits - 1):
             circuit.cx(target, target + 1)
     return circuit
@@ -130,7 +135,10 @@ class TestRunSimulation:
         assert isinstance(result, SimulationResult)
         assert result.shots == 1024
         assert result.num_qubits == 2
-        assert result.method == "matrix_product_state"
+        # Bell is Clifford: the P3 selector routes it to the stabilizer backend.
+        assert result.backend == "stabilizer"
+        assert result.method == "stabilizer"
+        assert result.selection_reasons
         assert sum(result.counts.values()) == 1024
         # Bell state: only |00> and |11> may appear.
         assert set(result.counts) <= {"00", "11"}
@@ -179,6 +187,11 @@ class TestRunSimulation:
                     {
                         "name": inst.operation.name,
                         "qubits": [circuit.find_bit(q).index for q in inst.qubits],
+                        **(
+                            {"params": [float(p) for p in inst.operation.params]}
+                            if inst.operation.params
+                            else {}
+                        ),
                     }
                     for inst in circuit.data
                 ],
@@ -186,5 +199,6 @@ class TestRunSimulation:
             "qiskit_json",
             64,
         )
+        assert result.backend == "statevector"
         assert result.method == "statevector"
         assert sum(result.counts.values()) == 64
