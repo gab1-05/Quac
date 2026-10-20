@@ -29,7 +29,7 @@ jobs:
     name: Lint, types, tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:
@@ -70,7 +70,7 @@ jobs:
       run:
         working-directory: terraform
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -89,7 +89,7 @@ jobs:
     name: Trivy scan (vuln, misconfig, secret)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Trivy filesystem scan
         # Vuln DB lives in the Actions runner's fast network; misconfig +
@@ -113,7 +113,7 @@ jobs:
       # Deterministic poll budget for CI runners (image pulls dominate startup).
       QUAC_E2E_POLL_TIMEOUT: "180"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build images and start the stack
         # --wait blocks on the localstack healthcheck and the api HEALTHCHECK.

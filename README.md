@@ -1,5 +1,7 @@
 # Quac — Serverless Quantum Simulation Model-as-a-Service (MaaS)
 
+[![CI](https://github.com/gab1-05/Quac/actions/workflows/ci.yml/badge.svg)](https://github.com/gab1-05/Quac/actions/workflows/ci.yml)
+
 **Quac** is a production-grade, serverless platform that accepts quantum circuits
 (OpenQASM 3.0 strings or serialized Qiskit/Cirq JSON), processes them
 asynchronously on highly optimized classical compute, and streams signed results
