@@ -296,6 +296,14 @@ def _circuit_from_cirq_json(payload: dict[str, Any]) -> QuantumCircuit:
     except Exception as exc:
         raise SimulationBuildError(f"cirq_json parse failure: {exc}") from exc
 
+    # cirq.read_json silently passes through JSON that carries no cirq_type
+    # (e.g. a bare dict); fail with the typed error instead of an opaque
+    # AttributeError deep in translation.
+    if not isinstance(cirq_circuit, cirq.Circuit):
+        raise SimulationBuildError(
+            "cirq_json payload did not deserialize to a cirq.Circuit"
+        )
+
     return _translate_cirq_circuit(cirq_circuit)
 
 

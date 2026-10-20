@@ -94,7 +94,7 @@ jobs:
       - name: Trivy filesystem scan
         # Vuln DB lives in the Actions runner's fast network; misconfig +
         # secret scanners cover Dockerfiles, compose, and IaC in the same pass.
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -116,9 +116,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build images and start the stack
-        # --wait blocks on the localstack healthcheck and the api HEALTHCHECK;
-        # the one-shot init service runs as a dependency of worker.
-        run: docker compose up -d --build --wait localstack init api worker webhook
+        # --wait blocks on the localstack healthcheck and the api HEALTHCHECK.
+        # init is NOT listed: it is a one-shot service (exits 0 when done) that
+        # --wait would misreport as unhealthy; worker's depends_on
+        # "service_completed_successfully" runs and awaits it instead.
+        run: docker compose up -d --build --wait localstack api worker webhook
 
       - name: Drive API -> queue -> worker -> S3 -> webhook
         run: docker compose run --rm e2e
