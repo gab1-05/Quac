@@ -157,6 +157,13 @@ variable "webhook_secret" {
   default     = ""
 }
 
+variable "secret_key" {
+  description = "HMAC pepper for API-key secret hashing (QUAC_SECRET_KEY); store in Secrets Manager in real deployments."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "s3_lifecycle_glacier_deep_archive_days" {
   description = "Days before result objects transition to Glacier Deep Archive."
   type        = number

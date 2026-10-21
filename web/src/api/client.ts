@@ -20,11 +20,20 @@ export type AnalysisRecommendation = components['schemas']['AnalysisRecommendati
 export type AnalysisWarning = components['schemas']['AnalysisWarning']
 export type BackendCapability = components['schemas']['BackendCapability']
 export type CircuitFormat = components['schemas']['CircuitFormat']
+export type ApiKeyCreatedResponse = components['schemas']['ApiKeyCreatedResponse']
+export type ApiKeyListResponse = components['schemas']['ApiKeyListResponse']
+export type ApiKeyRevokeResponse = components['schemas']['ApiKeyRevokeResponse']
+export type ApiKeySummary = components['schemas']['ApiKeySummary']
+export type AuthUserResponse = components['schemas']['AuthUserResponse']
 export type JobCancelResponse = components['schemas']['JobCancelResponse']
 export type JobResultPayload = components['schemas']['JobResultPayload']
 export type JobResultResponse = components['schemas']['JobResultResponse']
+export type JobListItem = components['schemas']['JobListItem']
+export type JobListResponse = components['schemas']['JobListResponse']
 export type JobStatus = components['schemas']['JobStatus']
 export type JobStatusResponse = components['schemas']['JobStatusResponse']
+export type LoginPayload = components['schemas']['LoginRequest']
+export type RegisterPayload = components['schemas']['RegisterRequest']
 export type SimulationAcceptedResponse = components['schemas']['SimulationAcceptedResponse']
 
 /** `GET /healthz` body (the OpenAPI schema types this as a free-form record). */
@@ -181,4 +190,84 @@ export function cancelJob(jobId: string): Promise<JobCancelResponse> {
   return request<JobCancelResponse>(`/v1/quantum/jobs/${encodeURIComponent(jobId)}/cancel`, {
     method: 'POST',
   })
+}
+
+// ---------------------------------------------------------------------------------------
+// Identity (P1): session auth, API keys, owner-scoped job listing
+// ---------------------------------------------------------------------------------------
+
+/** `POST /v1/auth/register` — open registration; the API sets the session cookie. */
+export function register(payload: RegisterPayload): Promise<AuthUserResponse> {
+  return request<AuthUserResponse>('/v1/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** `POST /v1/auth/login` — username/password; the API sets the session cookie. */
+export function login(payload: LoginPayload): Promise<AuthUserResponse> {
+  return request<AuthUserResponse>('/v1/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+/** `POST /v1/auth/logout` — deletes the session and clears the cookie (idempotent). */
+export function logout(): Promise<{ detail: string }> {
+  return request<{ detail: string }>('/v1/auth/logout', { method: 'POST' })
+}
+
+/**
+ * `GET /v1/auth/me` — bootstraps the current identity.
+ *
+ * Throws an {@link ApiError} with `status === 401` when there is no valid
+ * session, which callers treat as "anonymous" rather than a failure.
+ */
+export function getMe(): Promise<AuthUserResponse> {
+  return request<AuthUserResponse>('/v1/auth/me')
+}
+
+/** `POST /v1/keys` — mint an API key; `key` is the only time the secret exists client-side. */
+export function createApiKey(label: string): Promise<ApiKeyCreatedResponse> {
+  return request<ApiKeyCreatedResponse>('/v1/keys', {
+    method: 'POST',
+    body: JSON.stringify({ label }),
+  })
+}
+
+/** `GET /v1/keys` — metadata for the caller's keys (never secrets). */
+export function listApiKeys(): Promise<ApiKeyListResponse> {
+  return request<ApiKeyListResponse>('/v1/keys')
+}
+
+/** `DELETE /v1/keys/{key_id}` — revoke a key; requests using it fail with 401 afterwards. */
+export function revokeApiKey(keyId: string): Promise<ApiKeyRevokeResponse> {
+  return request<ApiKeyRevokeResponse>(`/v1/keys/${encodeURIComponent(keyId)}`, {
+    method: 'DELETE',
+  })
+}
+
+/** Filters accepted by {@link listJobs}. */
+export interface JobListParams {
+  /** Only return jobs in this lifecycle state. */
+  status?: JobStatus | null
+  /** Page size, clamped server-side to 1-100 (default 20). */
+  limit?: number
+  /** Opaque cursor from a previous page's `next_cursor`. */
+  cursor?: string | null
+}
+
+/**
+ * `GET /v1/quantum/jobs` — the caller's own jobs, newest first, cursor-paginated.
+ *
+ * Returns an empty `jobs` list for a brand-new account; never any other
+ * tenant's rows (the API scopes by identity).
+ */
+export function listJobs(params: JobListParams = {}): Promise<JobListResponse> {
+  const query = new URLSearchParams()
+  if (params.status) query.set('status', params.status)
+  if (params.limit !== undefined) query.set('limit', String(params.limit))
+  if (params.cursor) query.set('cursor', params.cursor)
+  const qs = query.toString()
+  return request<JobListResponse>(`/v1/quantum/jobs${qs ? `?${qs}` : ''}`)
 }

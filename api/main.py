@@ -3,11 +3,14 @@
 Endpoints
 ---------
 * ``POST /v1/quantum/simulate`` — validate a circuit through the firewall,
-  persist a job record, enqueue it onto the SQS FIFO queue and answer with
-  ``202 Accepted`` plus a fresh UUIDv4 ``job_id``.
+  enforce plan limits and quotas, persist a job record, enqueue it onto the
+  SQS FIFO queue and answer with ``202 Accepted`` plus a fresh UUIDv4
+  ``job_id``.
 * ``POST /v1/quantum/analyze`` — synchronous pre-flight analysis (exact
   metrics, labelled estimates, warnings, backend recommendation) with zero
   side effects: nothing is persisted or enqueued.
+* ``GET  /v1/quantum/jobs`` — the caller's own jobs, newest first
+  (owner-scoped, cursor-paginated).
 * ``GET  /v1/quantum/jobs/{job_id}`` — job tracking, guarded by a global
   sliding-window rate limiter shared across every route in the process.
 * ``GET  /v1/quantum/jobs/{job_id}/result`` — terminal-state result payload
@@ -16,6 +19,12 @@ Endpoints
   has not yet reached a terminal state.
 * ``GET  /v1/quantum/formats`` — supported formats and platform ceilings.
 * ``GET  /healthz`` — liveness probe for the ALB target group.
+* ``/v1/auth/*`` and ``/v1/keys`` — registration, session login and API-key
+  management (see :mod:`api.auth_routes`).
+
+All ``/v1/quantum/*`` routes except ``/v1/quantum/formats`` require an
+``X-API-Key`` header or the ``quac_session`` cookie (see
+:func:`api.auth.require_identity`). Cross-tenant job ids read as ``404``.
 
 All blocking I/O (DynamoDB, S3, SQS) is executed off the event loop. Static
 circuit validation — including the 28-qubit infrastructure cost firewall —
@@ -26,26 +35,36 @@ instantly with ``422`` and never reach the compute plane.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
-import time
 import uuid
-from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Final
+from typing import Annotated, Any, Final
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
-from . import __version__, database, queue_service, results_service
+from . import __version__, auth, database, identity, queue_service, results_service
+from .auth import Identity, require_identity
+from .auth_routes import router as auth_router
+from .ratelimit import (
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    SlidingWindowRateLimiter,
+    rate_limit,
+    rate_limiter,
+)
 from .schemas import (
     AnalysisRequest,
     CircuitAnalysisResponse,
     CircuitFormat,
     CircuitValidationError,
     JobCancelResponse,
+    JobListItem,
+    JobListResponse,
     JobResultPayload,
     JobResultResponse,
     JobStatus,
@@ -70,8 +89,6 @@ logger = logging.getLogger("quac.api")
 # Configuration
 # --------------------------------------------------------------------------------------
 
-RATE_LIMIT_REQUESTS: Final[int] = int(os.getenv("QUAC_RATE_LIMIT_REQUESTS", "120"))
-RATE_LIMIT_WINDOW_SECONDS: Final[float] = float(os.getenv("QUAC_RATE_LIMIT_WINDOW", "60"))
 MAX_TRACKING_ERROR_CHARS: Final[int] = 2048
 
 # Starlette renamed HTTP_422_UNPROCESSABLE_ENTITY -> ..._CONTENT; prefer the
@@ -87,74 +104,9 @@ def _uuid4() -> str:
 # --------------------------------------------------------------------------------------
 # Global sliding-window rate limiter
 # --------------------------------------------------------------------------------------
-
-
-class SlidingWindowRateLimiter:
-    """Per-client fixed-capacity sliding-window limiter.
-
-    Deployed as a *global* FastAPI dependency so that every protected route
-    (currently the job tracking endpoint) draws from the same limiter instance
-    within a process. Stale timestamps are pruned on access, and an asyncio
-    lock serialises admissions so concurrent requests cannot over-admit past
-    the window cap.
-    """
-
-    def __init__(self, max_requests: int, window_seconds: float) -> None:
-        self._max_requests = max_requests
-        self._window = window_seconds
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
-        self._lock = asyncio.Lock()
-
-    async def check(self, key: str) -> tuple[bool, float]:
-        """Record a hit for ``key``; return ``(allowed, retry_after_seconds)``."""
-        now = time.monotonic()
-        async with self._lock:
-            bucket = self._hits[key]
-            while bucket and now - bucket[0] >= self._window:
-                bucket.popleft()
-            if len(bucket) >= self._max_requests:
-                oldest = bucket[0]
-                retry_after = max(0.0, self._window - (now - oldest))
-                return False, retry_after
-            bucket.append(now)
-            return True, 0.0
-
-    async def reset(self) -> None:
-        """Clear all recorded hits (used by tests)."""
-        async with self._lock:
-            self._hits.clear()
-
-
-rate_limiter = SlidingWindowRateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
-
-
-def _client_key(request: Request) -> str:
-    """Prefer the earliest untrusted forwarding hop, else the socket peer."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client is not None:
-        return request.client.host
-    return "unknown"
-
-
-async def rate_limit(request: Request, response: Response) -> None:
-    """FastAPI dependency enforcing the global tracking rate limit."""
-    allowed, retry_after = await rate_limiter.check(_client_key(request))
-    if not allowed:
-        header_value = f"{retry_after:.0f}"
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error": "RATE_LIMIT_EXCEEDED",
-                "message": (
-                    f"limit is {RATE_LIMIT_REQUESTS} requests "
-                    f"per {RATE_LIMIT_WINDOW_SECONDS:.0f}s"
-                ),
-                "retry_after_seconds": round(retry_after, 3),
-            },
-            headers={"Retry-After": header_value},
-        )
+# The limiter implementation moved to ``api.ratelimit`` (shared with the
+# per-identity plan limiter). The names are re-exported here so existing
+# ``from api.main import rate_limiter`` call sites keep working.
 
 
 # --------------------------------------------------------------------------------------
@@ -216,8 +168,17 @@ app = FastAPI(
             "name": "ops",
             "description": "Liveness and operational probes.",
         },
+        {
+            "name": "auth",
+            "description": (
+                "Registration, session login and API-key management. Every /v1/quantum "
+                "route requires either an X-API-Key header or a session cookie."
+            ),
+        },
     ],
 )
+
+app.include_router(auth_router)
 
 
 # --------------------------------------------------------------------------------------
@@ -272,20 +233,121 @@ async def healthz() -> dict[str, str]:
     summary="Submit a circuit for asynchronous simulation",
     responses={
         202: {"description": "Job accepted and enqueued"},
+        401: {"description": "Missing or invalid credentials"},
+        403: {"description": "Plan limit exceeded (qubits/shots)"},
         422: {"description": "Validation firewall rejection"},
-        429: {"description": "Rate limit exceeded"},
+        429: {"description": "Rate limit or quota exceeded"},
         503: {"description": "Queue or store unavailable"},
     },
 )
-async def submit_simulation(request_body: SimulationRequest) -> SimulationAcceptedResponse:
+async def submit_simulation(
+    request_body: SimulationRequest,
+    principal: Annotated[Identity, Depends(require_identity)],
+) -> SimulationAcceptedResponse:
     """Validate, persist and enqueue a simulation job.
 
     The order of operations is deliberate: *all* static validation happens
     before the first write, so rejected payloads have zero infrastructure
-    footprint.
+    footprint. Admission gates then run cheapest-first (plan ceilings, then
+    concurrency, then the monthly counter) so quota-limited submits fail
+    before touching the job store.
     """
     qubit_count = validate_circuit_payload(request_body.circuit_data, request_body.format)
     webhook_url = str(request_body.webhook_url) if request_body.webhook_url else None
+
+    plan = principal.plan
+    # Plan ceilings run after the platform firewall: a circuit that violates
+    # the 28-qubit platform cap is a 422, one that exceeds the *plan's* width
+    # or shot budget is a 403.
+    if qubit_count > plan.max_qubits or request_body.shots > plan.max_shots:
+        auth.schedule_audit(
+            principal.user_id,
+            "plan.limit_exceeded",
+            {
+                "observed_qubits": qubit_count,
+                "plan_max_qubits": plan.max_qubits,
+                "observed_shots": request_body.shots,
+                "plan_max_shots": plan.max_shots,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "PLAN_LIMIT_EXCEEDED",
+                "message": (
+                    f"plan '{plan.name}' allows up to {plan.max_qubits} qubits "
+                    f"and {plan.max_shots} shots"
+                ),
+                "observed_qubits": qubit_count,
+                "plan_max_qubits": plan.max_qubits,
+                "observed_shots": request_body.shots,
+                "plan_max_shots": plan.max_shots,
+            },
+        )
+
+    # Monthly compute admission: recorded usage only — in-flight jobs may
+    # overshoot slightly (documented trade-off vs. serialising every submit).
+    month = identity.current_month()
+    usage_row = await identity.get_usage(principal.user_id, month)
+    compute_used = int(usage_row.get("compute_ms", 0)) if usage_row else 0
+    if compute_used >= plan.monthly_compute_ms:
+        auth.schedule_audit(
+            principal.user_id,
+            "quota.exceeded",
+            {"quota": "compute_ms", "used": compute_used, "limit": plan.monthly_compute_ms},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "QUOTA_EXCEEDED",
+                "message": f"plan '{plan.name}' monthly compute budget exhausted",
+                "quota": "compute_ms",
+                "used_ms": compute_used,
+                "limit_ms": plan.monthly_compute_ms,
+                "month": month,
+            },
+        )
+
+    # Concurrent-job cap (soft: the owner GSI is eventually consistent).
+    active = await database.count_active_jobs(principal.user_id)
+    if active >= plan.max_concurrent_jobs:
+        auth.schedule_audit(
+            principal.user_id,
+            "quota.exceeded",
+            {"quota": "concurrent_jobs", "used": active, "limit": plan.max_concurrent_jobs},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "TOO_MANY_ACTIVE_JOBS",
+                "message": (
+                    f"plan '{plan.name}' allows {plan.max_concurrent_jobs} "
+                    "queued/processing jobs"
+                ),
+                "active_jobs": active,
+                "limit": plan.max_concurrent_jobs,
+            },
+        )
+
+    # Atomic monthly request counter (conditional ADD — race-safe).
+    try:
+        await identity.reserve_request_quota(principal.user_id, month, plan.monthly_requests)
+    except identity.QuotaExceededError:
+        auth.schedule_audit(
+            principal.user_id,
+            "quota.exceeded",
+            {"quota": "requests", "limit": plan.monthly_requests, "month": month},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "QUOTA_EXCEEDED",
+                "message": f"plan '{plan.name}' monthly request quota exhausted",
+                "quota": "requests",
+                "limit": plan.monthly_requests,
+                "month": month,
+            },
+        ) from None
 
     job_id = _uuid4()
     payload_json = json.dumps(
@@ -308,6 +370,7 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
             webhook_url=webhook_url,
             qubit_count=qubit_count,
             idempotency_key=request_body.idempotency_key,
+            owner_id=principal.user_id,
         )
     except FileExistsError:
         logger.error("uuid collision on job_id=%s", job_id)
@@ -364,22 +427,50 @@ async def submit_simulation(request_body: SimulationRequest) -> SimulationAccept
     dependencies=[Depends(rate_limit)],
     responses={
         200: {"description": "Pre-flight analysis report"},
+        401: {"description": "Missing or invalid credentials"},
         422: {"description": "Validation firewall rejection or unparseable circuit"},
-        429: {"description": "Rate limit exceeded"},
+        429: {"description": "Rate limit or quota exceeded"},
     },
 )
-async def analyze_circuit(request_body: AnalysisRequest) -> CircuitAnalysisResponse:
+async def analyze_circuit(
+    request_body: AnalysisRequest,
+    principal: Annotated[Identity, Depends(require_identity)],
+) -> CircuitAnalysisResponse:
     """Compute the pre-flight report for a circuit — synchronously.
 
     The firewall runs first (identical rules to simulation ingestion), then
     the shared ``core`` analyzer derives exact structural metrics, labelled
     estimates and the backend recommendation. This endpoint has **zero side
     effects**: no job record, no queue message, no object storage write.
+    Analysis counts against the monthly *request* quota (it is real work for
+    the platform) but is not gated on the plan's qubit/shot ceilings — it
+    exists precisely to let users check circuits before submitting.
 
     The qiskit/cirq import is deferred to the first call so process boot and
     ``/healthz`` stay fast on cold starts.
     """
     validate_circuit_payload(request_body.circuit_data, request_body.format)
+
+    plan = principal.plan
+    month = identity.current_month()
+    try:
+        await identity.reserve_request_quota(principal.user_id, month, plan.monthly_requests)
+    except identity.QuotaExceededError:
+        auth.schedule_audit(
+            principal.user_id,
+            "quota.exceeded",
+            {"quota": "requests", "limit": plan.monthly_requests, "month": month},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "QUOTA_EXCEEDED",
+                "message": f"plan '{plan.name}' monthly request quota exhausted",
+                "quota": "requests",
+                "limit": plan.monthly_requests,
+                "month": month,
+            },
+        ) from None
 
     # Deferred imports: qiskit/cirq are heavy; keep them off the boot path so
     # process start and /healthz stay fast on cold starts.
@@ -405,38 +496,48 @@ async def analyze_circuit(request_body: AnalysisRequest) -> CircuitAnalysisRespo
     return CircuitAnalysisResponse.model_validate(report)
 
 
-async def _fetch_job_record(job_id: str) -> dict[str, Any]:
-    """Resolve a path job id to its record, mapping misses onto 404/503.
+def _job_not_found(job_id: str) -> HTTPException:
+    """The single 404 envelope for unknown *and* foreign-tenant job ids.
+
+    Cross-tenant reads return the same shape as a missing id so job
+    existence is never confirmed across tenant boundaries.
+    """
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
+    )
+
+
+async def _fetch_job_record(job_id: str, owner_id: str) -> dict[str, Any]:
+    """Resolve a path job id to the caller's record, mapping misses onto 404/503.
 
     Centralised so every job-scoped route applies identical id-shape checks
-    (strict UUIDv4) and identical failure envelopes.
+    (strict UUIDv4), identical ownership enforcement (cross-tenant rows read
+    as 404) and identical failure envelopes.
     """
     try:
         parsed = uuid.UUID(job_id)
     except (ValueError, AttributeError, TypeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
-        ) from exc
+        raise _job_not_found(job_id) from exc
     if parsed.version != 4:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
-        )
+        raise _job_not_found(job_id)
 
     try:
-        return await database.get_job_record(job_id)
+        record = await database.get_job_record(job_id)
     except database.JobRecordNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
-        ) from exc
+        raise _job_not_found(job_id) from exc
     except Exception as exc:
         logger.exception("job lookup failed job_id=%s", job_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error": "PERSISTENCE_UNAVAILABLE", "message": "job store unreachable"},
         ) from exc
+
+    if str(record.get("owner_id", "")) != owner_id:
+        # Foreign tenant (or an unowned legacy row): indistinguishable from a
+        # missing id, so job existence never leaks across tenants.
+        raise _job_not_found(job_id)
+    return record
 
 
 def _truncate_error(message: str | None) -> str | None:
@@ -453,13 +554,16 @@ def _truncate_error(message: str | None) -> str | None:
     summary="Track a simulation job",
     dependencies=[Depends(rate_limit)],
     responses={
-        404: {"description": "Unknown job id"},
+        401: {"description": "Missing or invalid credentials"},
+        404: {"description": "Unknown job id (or another tenant's)"},
         429: {"description": "Rate limit exceeded"},
     },
 )
-async def get_job(job_id: str) -> JobStatusResponse:
+async def get_job(
+    job_id: str, principal: Annotated[Identity, Depends(require_identity)]
+) -> JobStatusResponse:
     """Return the current lifecycle state of a previously submitted job."""
-    record = await _fetch_job_record(job_id)
+    record = await _fetch_job_record(job_id, principal.user_id)
 
     return JobStatusResponse(
         job_id=str(record["job_id"]),
@@ -477,20 +581,23 @@ async def get_job(job_id: str) -> JobStatusResponse:
     summary="Fetch a terminal job's result",
     dependencies=[Depends(rate_limit)],
     responses={
-        404: {"description": "Unknown job id"},
+        401: {"description": "Missing or invalid credentials"},
+        404: {"description": "Unknown job id (or another tenant's)"},
         409: {"description": "Job has not reached a terminal state yet"},
         429: {"description": "Rate limit exceeded"},
         503: {"description": "Result artifact store unavailable"},
     },
 )
-async def get_job_result(job_id: str) -> JobResultResponse:
+async def get_job_result(
+    job_id: str, principal: Annotated[Identity, Depends(require_identity)]
+) -> JobResultResponse:
     """Return the result payload for a terminal job.
 
     ``409`` while the job is still queued or processing; ``200`` with
     ``result: null`` for failed/cancelled jobs; ``200`` with the counts and a
     pre-signed download URL for completed jobs.
     """
-    record = await _fetch_job_record(job_id)
+    record = await _fetch_job_record(job_id, principal.user_id)
     job_state = JobStatus(record.get("status", JobStatus.QUEUED.value))
 
     if not job_state.is_terminal:
@@ -573,32 +680,25 @@ async def get_job_result(job_id: str) -> JobResultResponse:
     summary="Cancel a job that has not finished",
     dependencies=[Depends(rate_limit)],
     responses={
-        404: {"description": "Unknown job id"},
+        401: {"description": "Missing or invalid credentials"},
+        404: {"description": "Unknown job id (or another tenant's)"},
         409: {"description": "Job already reached a terminal state"},
         429: {"description": "Rate limit exceeded"},
         503: {"description": "Job store unavailable"},
     },
 )
-async def cancel_job(job_id: str) -> JobCancelResponse:
+async def cancel_job(
+    job_id: str, principal: Annotated[Identity, Depends(require_identity)]
+) -> JobCancelResponse:
     """Cancel a queued or running job.
 
     The transition is conditional in the store: a job that finishes while the
     cancel request is in flight is *not* overwritten — the request fails with
     ``409`` instead. A worker that is already computing observes the cancelled
-    status at its next checkpoint and discards the late result.
+    status at its next checkpoint and discards the late result. Ownership is
+    confirmed first so a foreign job id reads as ``404`` before any write.
     """
-    try:
-        parsed_id = uuid.UUID(job_id)
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
-        ) from exc
-    if parsed_id.version != 4:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "JOB_NOT_FOUND", "message": f"unknown job id {job_id!r}"},
-        )
+    await _fetch_job_record(job_id, principal.user_id)
 
     try:
         record = await database.cancel_job_record(job_id)
@@ -630,6 +730,89 @@ async def cancel_job(job_id: str) -> JobCancelResponse:
     )
 
 
+def _encode_cursor(last_evaluated_key: dict[str, Any] | None) -> str | None:
+    """Encode a GSI page boundary as an opaque base64 cursor."""
+    if not last_evaluated_key:
+        return None
+    raw = json.dumps(last_evaluated_key, separators=(",", ":"), default=str)
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> dict[str, Any]:
+    """Decode a client cursor; ``400`` when it is not one we emitted."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        decoded = json.loads(raw)
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "INVALID_CURSOR", "message": "cursor is not a valid page token"},
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "INVALID_CURSOR", "message": "cursor is not a valid page token"},
+        )
+    return decoded
+
+
+@app.get(
+    "/v1/quantum/jobs",
+    response_model=JobListResponse,
+    tags=["simulation"],
+    summary="List the caller's jobs (newest first)",
+    dependencies=[Depends(rate_limit)],
+    responses={
+        400: {"description": "Malformed pagination cursor"},
+        401: {"description": "Missing or invalid credentials"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+async def list_jobs(
+    principal: Annotated[Identity, Depends(require_identity)],
+    job_status: Annotated[JobStatus | None, Query(alias="status")] = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> JobListResponse:
+    """Page through the caller's own jobs, newest first.
+
+    Reads run off the ``owner_id-index`` GSI and filter on ``entity`` so
+    identity rows sharing the owner never appear. ``next_cursor`` is opaque;
+    pass it back verbatim for the next page (``null`` when exhausted).
+    """
+    exclusive_start_key = _decode_cursor(cursor) if cursor else None
+    try:
+        items, last_key = await database.list_jobs_by_owner(
+            principal.user_id,
+            status=job_status.value if job_status else None,
+            limit=max(1, min(limit, 100)),
+            exclusive_start_key=exclusive_start_key,
+        )
+    except Exception as exc:
+        logger.exception("job list failed owner=%s", principal.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "PERSISTENCE_UNAVAILABLE", "message": "job store unreachable"},
+        ) from exc
+
+    return JobListResponse(
+        jobs=[
+            JobListItem(
+                job_id=str(item.get("job_id", "")),
+                status=JobStatus(item.get("status", JobStatus.QUEUED.value)),
+                created_at=str(item.get("created_at", "")),
+                completed_at=item.get("completed_at"),
+                format=str(item.get("format", "")),
+                shots=int(item.get("shots", 0) or 0),
+                qubit_count=int(item.get("qubit_count", 0) or 0),
+                error_message=_truncate_error(item.get("error_message")),
+            )
+            for item in items
+        ],
+        next_cursor=_encode_cursor(last_key),
+    )
+
+
 @app.get("/v1/quantum/formats", tags=["simulation"], summary="List accepted circuit formats")
 async def list_formats() -> dict[str, Any]:
     """Advertise the supported serialization formats and the qubit ceiling."""
@@ -642,8 +825,10 @@ async def list_formats() -> dict[str, Any]:
 
 __all__ = [
     "CircuitFormat",
+    "Identity",
     "SlidingWindowRateLimiter",
     "app",
     "rate_limit",
     "rate_limiter",
+    "require_identity",
 ]

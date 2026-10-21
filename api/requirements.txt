@@ -9,6 +9,9 @@ uvicorn[standard]==0.32.1
 gunicorn==23.0.0
 boto3==1.35.86
 botocore==1.35.86
+# --- Authentication (P1) --------------------------------------------------------------
+# argon2id password hashing (OWASP-recommended parameters are set in code).
+argon2-cffi==25.1.0
 # --- Pre-flight analyzer (core/) ------------------------------------------------------
 # The API imports qiskit/cirq to compute exactly the circuit structure the
 # worker would execute (POST /v1/quantum/analyze + the shared core/ package).

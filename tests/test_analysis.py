@@ -402,7 +402,14 @@ class TestAnalyzeEndpoint:
         )
         assert response.status_code == 422
         assert response.json()["detail"]["error"] == "FILE_INCLUDE_BANNED"
-        assert stubbed_backend["calls"] == {"create": [], "update": [], "enqueue": [], "cancel": []}
+        assert stubbed_backend["calls"] == {
+            "create": [],
+            "update": [],
+            "enqueue": [],
+            "cancel": [],
+            "list": [],
+            "count_active": [],
+        }
 
     def test_qubit_cap_enforced(self, client) -> None:
         response = client.post(

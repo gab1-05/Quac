@@ -38,10 +38,15 @@ back to consumers through a resilient webhook framework.
 quantum-maas-platform/
 ├── api/                        # Ingestion layer (FastAPI on ECS Fargate)
 │   ├── __init__.py
-│   ├── main.py                 # endpoints (simulate/track/result/cancel/analyze), rate limiter
-│   ├── schemas.py              # Pydantic v2 contracts + validation firewall
-│   ├── database.py             # pooled DynamoDB job store (async wrappers)
+│   ├── main.py                 # quantum endpoints (simulate/analyze/track/result/cancel/list)
+│   ├── schemas.py              # Pydantic v2 contracts + validation firewall + auth/jobs models
+│   ├── database.py             # pooled DynamoDB job store (create, owner-list, active-count)
 │   ├── queue_service.py        # SQS FIFO publisher + dedup-id derivation
+│   ├── auth.py                 # argon2id hashing, key/session minting, require_identity dep
+│   ├── auth_routes.py          # /v1/auth (register·login·logout·me) + /v1/keys CRUD
+│   ├── identity.py             # single-table identity store (users/keys/sessions/usage/audit)
+│   ├── plans.py                # plan tiers — every quota ceiling enforced before side effects
+│   ├── ratelimit.py            # global per-IP sliding-window limiter (429 + Retry-After)
 │   ├── requirements.txt
 │   └── Dockerfile.api          # multi-stage, non-root, gunicorn+uvicorn
 ├── core/                       # Shared package used by both planes
@@ -68,27 +73,29 @@ quantum-maas-platform/
 │   │   │   ├── schema.ts       # types generated from the FastAPI OpenAPI spec
 │   │   │   └── client.ts       # typed fetch client + normalised ApiError envelope
 │   │   ├── components/
-│   │   │   ├── Shell.tsx       # nav, API status pill (GET /healthz), theme toggle
+│   │   │   ├── Shell.tsx       # nav, identity menu, API status pill, theme toggle
 │   │   │   └── ui.tsx          # Card/Badge/Stat/ErrorBanner/Skeleton/…
 │   │   ├── lib/
-│   │   │   ├── history.ts      # browser-local submission history (localStorage)
+│   │   │   ├── auth.tsx        # AuthProvider: /v1/auth/me boot + login/register/logout
 │   │   │   ├── theme.tsx       # dark-first theme provider (dark/light/system)
 │   │   │   ├── format.ts       # bytes/seconds/USD/timestamp display helpers
 │   │   │   └── hooks.ts        # useDebouncedValue
 │   │   ├── pages/
-│   │   │   ├── Overview.tsx    # API status, platform limits, recent submissions
+│   │   │   ├── AuthPage.tsx    # /login + /register (session-cookie auth)
+│   │   │   ├── Overview.tsx    # API status, platform limits, account usage, recent jobs
 │   │   │   ├── Studio.tsx      # circuit editor + live analyze + run
-│   │   │   ├── Jobs.tsx        # lookup by id + browser-local history
+│   │   │   ├── Jobs.tsx        # server-side job list: cursor pages, status filter, id lookup
 │   │   │   └── JobDetail.tsx   # live status polling + result document + cancel
 │   │   └── index.css           # Tailwind v4 + design tokens (dark-first)
 │   ├── vite.config.ts          # dev proxy /v1 + /healthz → localhost:8000
 │   └── package.json            # react 19, react-router 7, @tanstack/react-query 5
-├── tests/                      # pytest suite (213 tests)
+├── tests/                      # pytest suite (294 tests, 15 files)
 ├── scripts/                    # local end-to-end runtime (LocalStack)
 │   ├── localstack_init.py      # idempotent table/queue/bucket bootstrap
 │   ├── local_worker.py         # long-poll loop invoking the real lambda_handler
 │   ├── webhook_receiver.py     # HMAC-verifying callback sink
-│   └── e2e.py                  # drives API → SQS → worker → S3 → webhook
+│   ├── migrate_ownership.py    # backfill pre-P1 rows (entity/owner/schema), idempotent
+│   └── e2e.py                  # 13-leg driver: auth → submit → worker → S3 → webhook → usage
 ├── docker-compose.yml          # localstack + api + worker + webhook + e2e
 ├── .github/workflows/ci.yml    # ruff · mypy · pytest · gitleaks · terraform · web · e2e
 ├── pyproject.toml              # ruff + mypy + pytest configuration
@@ -114,11 +121,72 @@ pip install -r api/requirements.txt
 uvicorn api.main:app --reload --port 8000
 ```
 
+### Authenticate — sessions and API keys (P1)
+
+Every `/v1/*` route requires an identity **except** the four open routes:
+
+| Open route                  | Why it is public                                  |
+|-----------------------------|---------------------------------------------------|
+| `GET /healthz`              | liveness probe (no tenant data)                   |
+| `GET /v1/quantum/formats`   | capability discovery (platform limits, no data)   |
+| `POST /v1/auth/register`    | open sign-up (lands on the free plan)             |
+| `POST /v1/auth/login`       | credential exchange                               |
+
+Anything else without credentials returns the single generic envelope
+`401 {"detail": {"error": "UNAUTHENTICATED", "message": …}}` — no username
+oracle, no route disclosure (unknown logins verify against a dummy argon2 hash).
+
+**Register or log in** (the API sets an HTTP-only `quac_session` cookie):
+
+```bash
+curl -sS -c quac.cookies -X POST http://localhost:8000/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "acme-labs", "password": "correct horse battery staple"}'
+```
+
+* username: 3-32 chars `[a-z0-9_-]`, must start alphanumeric (case is folded to
+  lowercase, so `Alice` and `alice` are the same account); duplicate →
+  `409 USERNAME_TAKEN`.
+* password: 10-128 chars, stored as **argon2id** peppered with
+  `QUAC_SECRET_KEY` (compose sets `local-dev-secret`; terraform wires a
+  sensitive var — never committed).
+* `POST /v1/auth/login` takes the same body; `GET /v1/auth/me` returns your
+  identity, plan ceilings and this month's usage counters; `POST /v1/auth/logout`
+  deletes the session and clears the cookie (idempotent).
+
+**Or mint an API key** (recommended for automation — created from the session):
+
+```bash
+curl -sS -b quac.cookies -X POST http://localhost:8000/v1/keys \
+  -H 'Content-Type: application/json' -d '{"label": "ci-runner"}'
+```
+
+```json
+{
+  "key_id": "6f0d9c2a1b4e8d70",
+  "key": "qk_6f0d9c2a1b4e8d70_<32-char secret>",
+  "prefix": "qk_6f0d9c2a1b4e8d70",
+  "label": "ci-runner",
+  "created_at": "2026-10-21T04:00:00+00:00"
+}
+```
+
+* `key` is shown **exactly once** — only a peppered HMAC-SHA256 hash is
+  stored, and `GET /v1/keys` (list metadata) never returns secrets.
+* Send it as `-H 'X-API-Key: qk_…'`. The header **takes precedence over the
+  cookie** when both are present.
+* `DELETE /v1/keys/{key_id}` revokes instantly; the next request with that key
+  gets `401` (revoked cross-tenant → `404`, no existence oracle).
+
+Every example below includes the credential header — replace `$QUAC_KEY` with
+your `key` (or swap in `-b quac.cookies` for cookie auth).
+
 ### Submit a circuit
 
 ```bash
 curl -sS -X POST http://localhost:8000/v1/quantum/simulate \
   -H 'Content-Type: application/json' \
+  -H "X-API-Key: $QUAC_KEY" \
   -d '{
     "circuit_data": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\nh q[0];\ncx q[0], q[1];\nc = measure q;\n",
     "format": "qasm3",
@@ -147,7 +215,8 @@ http/https URL (credentials-in-URL → `422`).
 ### Track a job
 
 ```bash
-curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c
+curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c \
+  -H "X-API-Key: $QUAC_KEY"
 ```
 
 ```json
@@ -169,7 +238,8 @@ Status lifecycle: `queued → processing → completed | failed | cancelled`.
 ### Fetch a result
 
 ```bash
-curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/result
+curl -sS http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/result \
+  -H "X-API-Key: $QUAC_KEY"
 ```
 
 * `409 JOB_NOT_READY` while the job is still `queued`/`processing`;
@@ -187,7 +257,8 @@ from `QUAC_RESULTS_BUCKET` (default `quac-results`); the task role is scoped to
 ### Cancel a job
 
 ```bash
-curl -sS -X POST http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/cancel
+curl -sS -X POST http://localhost:8000/v1/quantum/jobs/3f6b1a9c-1f2d-4e5a-8b7c-9d0e1f2a3b4c/cancel \
+  -H "X-API-Key: $QUAC_KEY"
 ```
 
 Cancellation is atomic: a conditional DynamoDB transition moves a
@@ -202,6 +273,7 @@ the cancel (deleting the orphaned artifact) and delivers a
 ```bash
 curl -sS -X POST http://localhost:8000/v1/quantum/analyze \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: $QUAC_KEY" \
   -d '{"circuit_data": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\nh q[0];\ncx q[0], q[1];\nc = measure q;\n", "format": "qasm3", "shots": 1024}'
 ```
 
@@ -287,13 +359,102 @@ overestimates low-entanglement circuits; the `note` field says so.
 
 ---
 
-## Web console (P7 thin)
+## Plans, quotas & tenant isolation (P1)
+
+Every route under `/v1` is scoped to the authenticated identity. Job records
+carry `owner_id` + `entity="job"` (written at create), and the `owner_id-index`
+GSI answers tenant queries without a table scan.
+
+### Plan tiers (all ceilings are real, enforced admission checks)
+
+| Limit                              | free    | developer | pro     | enterprise |
+|------------------------------------|---------|-----------|---------|------------|
+| monthly requests (submit+analyze)  | 200     | 2 000     | 20 000  | 200 000    |
+| monthly compute                    | 1 h     | 10 h      | 50 h    | 500 h      |
+| concurrent queued/running jobs     | 2       | 8         | 32      | 128        |
+| max qubits per submitted circuit   | 12      | 20        | 28      | 28         |
+| max shots per run                  | 2 048   | 4 096     | 8 192   | 8 192      |
+| requests per minute per identity   | 60      | 180       | 600     | 1 200      |
+
+Registration always lands on `free` (`QUAC_DEFAULT_PLAN` overrides locally
+only). Tiers live in `api/plans.py`; the plan a user row names resolves via
+`get_plan()` which falls **down** to `free` for unknown tiers — never up.
+
+### Submission gate order (`POST /v1/quantum/simulate`)
+
+1. **firewall** → `422` (banned syntax, 28-qubit platform cap, size ceilings —
+   zero infra writes);
+2. **plan size** → `403 PLAN_LIMIT_EXCEEDED` (`observed_qubits` vs
+   `plan_max_qubits`, or shots vs `plan_max_shots`);
+3. **compute admission** → `429 QUOTA_EXCEEDED (quota: compute_ms)` against the
+   current month's recorded worker time;
+4. **concurrency** → `429 TOO_MANY_ACTIVE_JOBS` (owner's queued+processing count;
+   the GSI is eventually consistent, so this cap is soft by one — documented);
+5. **monthly request counter** → `429 QUOTA_EXCEEDED (quota: requests)` via an
+   atomic conditional `ADD` that cannot over-admit under concurrency;
+6. persist (`owner_id`, `entity`) → enqueue (`202`).
+
+`POST /v1/quantum/analyze` counts against the monthly **request** quota only —
+deliberately no plan size/shot ceilings, because pre-flight analysis exists to
+inspect big circuits before you run them. Rate limits (`429 RATE_LIMIT_EXCEEDED`
++ `Retry-After`) apply to both identities: the global per-IP window
+(`QUAC_RATE_LIMIT_REQUESTS/WINDOW`, default 120/60 s) and the per-plan
+per-minute window.
+
+Usage counters are read back from `GET /v1/auth/me` (`usage.requests`,
+`usage.compute_ms` for the current UTC month). The API increments `requests`
+at admission; the worker `ADD`s `compute_ms` after each terminal execution.
+
+### Owner-scoped job listing
+
+```bash
+curl -sS "http://localhost:8000/v1/quantum/jobs?status=completed&limit=20" \
+  -H "X-API-Key: $QUAC_KEY"
+```
+
+* newest first, **cursor-paginated**: response is
+  `{"jobs": [...], "next_cursor": "<opaque base64>|null"}`; pass `cursor=…` for
+  the next page (malformed cursor → `400 INVALID_CURSOR`, never a 500);
+* `status` filters to `queued|processing|completed|failed|cancelled`
+  (invalid value → `422`); `limit` is clamped to 1-100 server-side;
+* rows expose `job_id, status, created_at, completed_at, format, shots,
+  qubit_count, error_message` — never another tenant's data (see below).
+
+### Tenant isolation guarantees
+
+* reading/cancelling **someone else's** job id returns the same
+  `404 JOB_NOT_FOUND` envelope as a nonexistent id (message echoes only the
+  id you asked for) — existence never leaks;
+* listings are disjoint: a `USER#`/`KEY#` row sharing your `owner_id` can never
+  appear in `GET /v1/quantum/jobs` (the `entity` discriminator filters it);
+* cross-tenant key revoke → `404`, and your key keeps working;
+* the e2e driver proves each of these against the real stack with two accounts.
+
+### Legacy-row migration
+
+Records written before P1 (no `entity`/`owner_id`/`schema_version`) are
+backfilled by:
+
+```bash
+python scripts/migrate_ownership.py --dry-run   # report only
+python scripts/migrate_ownership.py             # SET entity="job", owner if absent → "system"
+```
+
+Idempotent (conditional on `attribute_not_exists`), `--owner <username>` bills a
+specific tenant instead of `system`, and the e2e run verifies dry-run → update →
+no-op-rerun against the live table. Such rows stay invisible to every user's
+listing (owner `system`).
+
+---
+
+## Web console
 
 `web/` is a React + Vite + TypeScript + Tailwind console in front of the same
-public API the CLI uses — same origin, no separate backend, no CORS. During
-development the Vite dev server proxies `/v1` and `/healthz` to
-`localhost:8000` (`web/vite.config.ts`); the thin slice does not yet ship its
-own container (nginx serving + the compose `web` service are P7.15).
+API the CLI uses — same origin, no separate backend, no CORS. Every page except
+`/login` and `/register` requires a session (see above). During development the
+Vite dev server proxies `/v1` and `/healthz` to `localhost:8000`
+(`web/vite.config.ts`); the console does not yet ship its own container
+(nginx serving + the compose `web` service are P7.15).
 
 ### Run it locally
 
@@ -303,6 +464,10 @@ cd web
 npm ci
 npm run dev                                   # console on localhost:5173
 ```
+
+Open `http://localhost:5173` — anonymous visitors are redirected to `/login`;
+register a free account (or sign in with one you created earlier) and the
+console boots your session, plan ceilings and job list.
 
 `npm run build` type-checks (`tsc -b`) and bundles for production; the CI
 `web` job runs exactly `npm ci` + `npm run build`.
@@ -318,30 +483,41 @@ npx openapi-typescript http://localhost:8000/openapi.json -o src/api/schema.ts
 
 | Route            | Page         | Functions                                                                     |
 |------------------|--------------|-------------------------------------------------------------------------------|
-| `/`              | **Overview** | live API health (`GET /healthz`), platform limits (`GET /v1/quantum/formats`: max qubits/shots, accepted formats), browser-local recent submissions |
-| `/studio`        | **Studio**   | circuit editor (OpenQASM 3 / Qiskit JSON / Cirq JSON), debounced pre-flight analysis (`POST /v1/quantum/analyze`: size, depth, estimated runtime/memory, backend recommendation + reason), backend override picker, run submission (`POST /v1/quantum/simulate`) with shot count and webhook options, structured firewall errors rendered with line/column hints |
-| `/jobs`          | **Jobs**     | lookup any job by id (`GET /v1/quantum/jobs/{id}`), browser-local history of this browser's submissions (newest 25) with live status refresh |
-| `/jobs/:jobId`   | **JobDetail**| live status polling (2 s while queued/running), full result document (counts, exact probabilities, backend, cost, memory, wall, S3 link) once completed, cancel action (`POST .../cancel`) while queued |
+| `/login`         | **AuthPage** | username/password sign-in (`POST /v1/auth/login`), link to register, deep-link redirect back to the originally requested route, real API errors (401/422) rendered from the envelope |
+| `/register`      | **AuthPage** | account creation (`POST /v1/auth/register` → free plan, session cookie set by the API), username/password rule hints, `409 USERNAME_TAKEN` handling |
+| `/`              | **Overview** | live API health (`GET /healthz`), platform limits (`GET /v1/quantum/formats`), **Account & usage** card (plan ceilings + this month's `requests`/`compute_ms` from `GET /v1/auth/me`), five newest owner-scoped jobs (`GET /v1/quantum/jobs?limit=5`) |
+| `/studio`        | **Studio**   | circuit editor (OpenQASM 3 / Qiskit JSON / Cirq JSON), debounced pre-flight analysis (`POST /v1/quantum/analyze`: size, depth, estimated runtime/memory, backend recommendation + reason), run submission (`POST /v1/quantum/simulate`) with a fresh idempotency key — after success the server list is invalidated and the job page opens, structured firewall errors rendered with line/column hints |
+| `/jobs`          | **Jobs**     | server-side listing (`GET /v1/quantum/jobs`): newest-first rows, status filter (`?status=`), cursor pagination ("Load older jobs"), live 5 s refresh while any row is queued/processing, lookup-any-job-by-id box, honest empty states |
+| `/jobs/:jobId`   | **JobDetail**| live status polling (2 s while queued/running, stops on terminal states), full result document (counts, exact probabilities, backend, reason, S3 link) once completed, cancel action (`POST .../cancel`) that also refreshes the list |
 
-Shared pieces: `Shell.tsx` (nav, API status pill from `/healthz`, dark/light/
-system theme toggle — dark-first), `ui.tsx` (Card/Badge/Stat/ErrorBanner/
-Skeleton/EmptyState), `client.ts` (typed fetch, normalises the API's
-`{detail}` error envelope into `ApiError`), `history.ts` (localStorage).
+Session handling: `lib/auth.tsx` boots every load from `GET /v1/auth/me`
+(`401` → anonymous, network failure → visible error, never a fake sign-out).
+`App.tsx` wraps the shell in `RequireAuth`: anonymous visitors are redirected
+to `/login` with the target route preserved; while the boot request is in
+flight the console shows "Checking session…" instead of flashing a redirect.
+Sign-out clears the session **and drops every cached tenant query**, so a
+second account on the same browser starts from an empty cache.
 
-### Honest scope notes (thin slice)
+Shared pieces: `Shell.tsx` (nav, identity menu — username, plan badge, sign
+out; API status pill from `/healthz`; dark/light/system theme toggle —
+dark-first), `ui.tsx` (Card/Badge/Stat/ErrorBanner/Skeleton/EmptyState/…),
+`client.ts` (typed fetch, normalises the API's `{detail}` error envelope into
+`ApiError`, plus the auth/keys/jobs-list calls), `schema.ts` (generated
+OpenAPI types).
 
-* **Job history is browser-local** (`localStorage`) because the API has no
-  owner-scoped job *list* endpoint yet — that arrives with P1 auth. The list
-  is never fabricated from server data it cannot see.
-* **No auth screens yet** — login/register land with P1; until then the
-  console drives the same unauthenticated public API the README documents.
+### Honest scope notes
+
 * **The editor is a plain monospace textarea** — CodeMirror with syntax
   highlighting, gutter and error markers is P7.4.
 * **No unit tests / served container yet** — vitest component tests are
   P7.16; the nginx + compose serving path is P7.15. The CI `web` job is a
-  build gate (type-check + bundle), and the pages were verified by driving
-  the real compose stack in a browser (analyze, submit → poll → result,
-  firewall error rendering, theme toggle).
+  build gate (type-check + bundle).
+* **Verified against the real stack in a browser** (not mocked): redirect to
+  `/login` when signed out, registration → session → Overview account card,
+  Studio submit → job page poll → real Bell counts + S3 download link, the
+  Jobs list showing only that account's rows, status-filter empty state,
+  sign-out → `/login`, and a second registered account seeing `0` jobs (no
+  cache bleed).
 
 ---
 
@@ -502,12 +678,24 @@ docker compose run --rm e2e      # submit → poll → verify S3 + signed callba
 docker compose logs -f webhook   # watch HMAC-signed callbacks arrive
 ```
 
-The `e2e` driver walks all six legs: API liveness, a firewall rejection (422,
-zero infra writes), a Bell-state submission (202 + UUIDv4), status polling to a
-terminal state, the `results/{Y}/{M}/{D}/{job_id}.json` S3 object (counts sum to
-shots, Bell correlations only), and the signed webhook callback at the sink.
-Exit code 0 means the entire path is healthy. `scripts/localstack_init.py` is
-idempotent and mirrors the Terraform-provisioned resources exactly.
+The `e2e` driver walks 13 legs with **two real tenants** (random usernames per
+run): API liveness; unauthenticated quantum routes refused (401) while
+`/healthz` and `/v1/quantum/formats` stay open; tenant A registers by session
+cookie (`201`, free plan, `409` on duplicate) and mints a shown-once API key
+(listing never exposes the secret); tenant B registers too; the firewall
+rejects a banned circuit pre-queue (422, zero infra writes); A submits a
+Bell-state circuit by API key (202 + UUIDv4); **tenant isolation** — B gets the
+same `404` for A's job id as for a missing one, cannot cancel it, and the two
+listings are disjoint; status polling to `completed`; the
+`results/{Y}/{M}/{D}/{job_id}.json` S3 object (counts sum to shots, Bell
+correlations only); the signed webhook callback at the sink; the **monthly
+usage counters** (`requests` recorded by the API, `compute_ms` settled by the
+worker, tenant-scoped); key revocation (revoked key → 401, B's key unaffected);
+and the **ownership migration** on a seeded pre-P1 row (dry-run reports it,
+update backfills `entity`/`owner`/`schema_version`, the rerun is a no-op, and
+the row never leaks into any tenant's listing). Exit code 0 means the entire
+path is healthy. `scripts/localstack_init.py` is idempotent and mirrors the
+Terraform-provisioned resources exactly.
 
 ---
 
@@ -556,7 +744,7 @@ The repo is scanned by the same chain CI and auditors use. The current baseline:
 ## Testing
 
 ```bash
-python -m pytest tests -q
+python -m pytest tests -q    # 294 tests across 15 files
 ```
 
 | File                            | Covers                                                            |
@@ -564,6 +752,11 @@ python -m pytest tests -q
 | `test_schemas_firewall.py`      | allow/deny matrix, injection vectors, 28-qubit cap (incl. cirq width from bare documents), Pydantic contract |
 | `test_queue_dedup.py`           | dedup-id determinism/precedence, envelope round-trip              |
 | `test_api_endpoints.py`         | 202 flow, 404s, rate-limit 429 + `Retry-After`, no-side-effect rejections |
+| `test_auth.py`                  | P1 identity: registration rules (username/password validation, 409), argon2id hashing, login/logout/me flows, session-cookie lifecycle, generic 401 envelope, credential precedence (API key over cookie) |
+| `test_api_keys.py`              | key minting (shown-once secret, peppered HMAC stored), listing never exposes secrets, revocation semantics (401 after revoke, cross-tenant 404) |
+| `test_quota.py`                 | plan ceilings per tier (free/developer/pro/enterprise), gate order (403 vs 429), atomic monthly request counter (no over-admission under concurrency), compute-ms admission, concurrency cap, per-plan rate limit + `Retry-After` |
+| `test_tenant_isolation.py`      | owner stamped on create, cross-tenant reads/cancels → identical 404, listings disjoint, identity rows (USER#/KEY#) never appear in job listings |
+| `test_jobs_list.py`             | owner-scoped listing contract: newest-first, cursor pagination (opaque token, invalid → 400), status filter (invalid → 422), limit clamped 1-100, empty state for new accounts |
 | `test_job_results_cancel.py`    | optional webhook, result readiness/artifact mapping, cancel transitions |
 | `test_database_records.py`      | record shape (owner/schema), conditional cancel + guarded updates |
 | `test_analysis.py`              | exact metrics, basis labels, warnings, backend recommendation + capability matrix, cross-format parity (qasm3/qiskit_json/cirq_json), worker parity, analyze endpoint contract, cirq translator correction |
@@ -582,5 +775,12 @@ SIGALRM tests skip on non-POSIX hosts (Lambda is Linux).
 * Webhook URLs: strict http/https, credentials-in-URL rejected.
 * HMAC-SHA256 signed callbacks; TLS-only bucket/queue policies; SSE on S3,
   SQS and DynamoDB; ECR image scanning + immutable tags; ALB TLS 1.3 policy.
+* Identity (P1): passwords hashed with **argon2id** peppered with
+  `QUAC_SECRET_KEY` (sensitive terraform var, never committed); session tokens
+  and API-key secrets stored only as peppered SHA-256/HMAC hashes — the raw
+  `qk_…` secret exists exactly once, in the create response; sessions expire
+  (24 h TTL, revoked on logout); auth events recorded as `AUDIT#` rows
+  (400-day TTL); unknown logins verify against a dummy hash and all failures
+  return one generic `401 UNAUTHENTICATED` (no username oracle).
 * Least-privilege IAM scoped to workspace ARNs; DLQ + CloudWatch alarms for
   error-rate and poison messages.

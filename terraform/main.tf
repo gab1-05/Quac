@@ -299,6 +299,9 @@ resource "aws_ecs_task_definition" "api" {
         { name = "QUAC_LOG_LEVEL", value = "INFO" },
         { name = "QUAC_RATE_LIMIT_REQUESTS", value = tostring(var.rate_limit_requests) },
         { name = "QUAC_RATE_LIMIT_WINDOW", value = tostring(var.rate_limit_window_seconds) },
+        { name = "QUAC_SECRET_KEY", value = var.secret_key },
+        # Cookies carry the session token: Secure behind the HTTPS ALB.
+        { name = "QUAC_COOKIE_SECURE", value = "1" },
         { name = "WEB_CONCURRENCY", value = "4" },
       ]
 

@@ -9,7 +9,6 @@
  * finished).
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   ApiError,
@@ -22,7 +21,6 @@ import {
 } from '../api/client'
 import { Badge, Card, Disclosure, EmptyState, ErrorBanner, Skeleton, Stat } from '../components/ui'
 import { formatDuration, formatInteger, formatTimestamp } from '../lib/format'
-import { updateJobStatus } from '../lib/history'
 
 const STATUS_TONE: Record<JobStatus, 'ok' | 'warn' | 'err' | 'accent' | 'neutral'> = {
   queued: 'neutral',
@@ -84,14 +82,13 @@ export default function JobDetail() {
     enabled: job.data?.status === 'completed',
   })
 
-  // Keep the browser-local history in sync with observed states.
-  useEffect(() => {
-    if (job.data) updateJobStatus(job.data.job_id, job.data.status)
-  }, [job.data])
-
   const cancel = useMutation({
     mutationFn: () => cancelJob(jobId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['job', jobId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['job', jobId] })
+      // Keep the owner-scoped list rows in sync with the new state.
+      queryClient.invalidateQueries({ queryKey: ['jobs'] })
+    },
   })
 
   if (job.isError) {

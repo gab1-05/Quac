@@ -4,6 +4,147 @@
  */
 
 export interface paths {
+    "/v1/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create an account (open registration, free plan)
+         * @description Register a new user and start a session.
+         *
+         *     The password is hashed with argon2id before the row is written. A
+         *     duplicate username returns the same generic conflict whether or not the
+         *     account exists — registration is public, so no stronger oracle is offered.
+         */
+        post: operations["register_v1_auth_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a session (username + password)
+         * @description Verify credentials and set the session cookie.
+         *
+         *     Unknown user and wrong password produce the identical 401; the unknown
+         *     path still performs a dummy argon2 verify so response timing does not
+         *     leak account existence.
+         */
+        post: operations["login_v1_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End the current session
+         * @description Delete the session row and clear the cookie (idempotent).
+         *
+         *     API-key callers have no session; the call is a no-op success so clients
+         *     can always hit logout on teardown.
+         */
+        post: operations["logout_v1_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The authenticated identity, plan and usage
+         * @description Return the caller's identity, plan ceilings and current-month usage.
+         */
+        get: operations["me_v1_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the caller's API keys
+         * @description List the caller's API keys (metadata only — never secrets).
+         */
+        get: operations["list_keys_v1_keys_get"];
+        put?: never;
+        /**
+         * Mint an API key (secret shown once)
+         * @description Create an API key for the caller.
+         *
+         *     The full ``qk_…`` token appears in this response only; the stored row
+         *     keeps an HMAC-SHA256 hash peppered with ``QUAC_SECRET_KEY``.
+         */
+        post: operations["create_key_v1_keys_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys/{key_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an API key
+         * @description Revoke one of the caller's keys.
+         *
+         *     A key owned by another tenant returns the same 404 as a missing key —
+         *     key ids are not confirmed across tenant boundaries.
+         */
+        delete: operations["revoke_key_v1_keys__key_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -39,7 +180,9 @@ export interface paths {
          *
          *     The order of operations is deliberate: *all* static validation happens
          *     before the first write, so rejected payloads have zero infrastructure
-         *     footprint.
+         *     footprint. Admission gates then run cheapest-first (plan ceilings, then
+         *     concurrency, then the monthly counter) so quota-limited submits fail
+         *     before touching the job store.
          */
         post: operations["submit_simulation_v1_quantum_simulate_post"];
         delete?: never;
@@ -65,6 +208,9 @@ export interface paths {
          *     the shared ``core`` analyzer derives exact structural metrics, labelled
          *     estimates and the backend recommendation. This endpoint has **zero side
          *     effects**: no job record, no queue message, no object storage write.
+         *     Analysis counts against the monthly *request* quota (it is real work for
+         *     the platform) but is not gated on the plan's qubit/shot ceilings — it
+         *     exists precisely to let users check circuits before submitting.
          *
          *     The qiskit/cirq import is deferred to the first call so process boot and
          *     ``/healthz`` stay fast on cold starts.
@@ -136,9 +282,34 @@ export interface paths {
          *     The transition is conditional in the store: a job that finishes while the
          *     cancel request is in flight is *not* overwritten — the request fails with
          *     ``409`` instead. A worker that is already computing observes the cancelled
-         *     status at its next checkpoint and discards the late result.
+         *     status at its next checkpoint and discards the late result. Ownership is
+         *     confirmed first so a foreign job id reads as ``404`` before any write.
          */
         post: operations["cancel_job_v1_quantum_jobs__job_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/quantum/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the caller's jobs (newest first)
+         * @description Page through the caller's own jobs, newest first.
+         *
+         *     Reads run off the ``owner_id-index`` GSI and filter on ``entity`` so
+         *     identity rows sharing the owner never appear. ``next_cursor`` is opaque;
+         *     pass it back verbatim for the next page (``null`` when exhausted).
+         */
+        get: operations["list_jobs_v1_quantum_jobs_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -390,6 +561,99 @@ export interface components {
             message: string;
         };
         /**
+         * ApiKeyCreateRequest
+         * @description ``POST /v1/keys`` body.
+         */
+        ApiKeyCreateRequest: {
+            /**
+             * Label
+             * @description Human label shown in key listings (e.g. 'ci-runner').
+             * @default default
+             */
+            label: string;
+        };
+        /**
+         * ApiKeyCreatedResponse
+         * @description ``POST /v1/keys`` response — ``key`` is shown exactly once.
+         */
+        ApiKeyCreatedResponse: {
+            /** Key Id */
+            key_id: string;
+            /**
+             * Key
+             * @description Full qk_… token. Store it now; it is never shown again.
+             */
+            key: string;
+            /**
+             * Prefix
+             * @description Safe-to-display key prefix (qk_<key_id>).
+             */
+            prefix: string;
+            /** Label */
+            label: string;
+            /** Created At */
+            created_at: string;
+        };
+        /**
+         * ApiKeyListResponse
+         * @description ``GET /v1/keys`` body.
+         */
+        ApiKeyListResponse: {
+            /** Keys */
+            keys: components["schemas"]["ApiKeySummary"][];
+        };
+        /**
+         * ApiKeyRevokeResponse
+         * @description ``DELETE /v1/keys/{key_id}`` body.
+         */
+        ApiKeyRevokeResponse: {
+            /** Key Id */
+            key_id: string;
+            /**
+             * Revoked
+             * @default true
+             */
+            revoked: boolean;
+            /**
+             * Detail
+             * @default key revoked; requests using it now fail with 401
+             */
+            detail: string;
+        };
+        /**
+         * ApiKeySummary
+         * @description One entry in ``GET /v1/keys`` (never includes the secret).
+         */
+        ApiKeySummary: {
+            /** Key Id */
+            key_id: string;
+            /** Prefix */
+            prefix: string;
+            /** Label */
+            label: string;
+            /** Created At */
+            created_at: string;
+            /** Revoked */
+            revoked: boolean;
+        };
+        /**
+         * AuthUserResponse
+         * @description Body returned by register/login/me.
+         */
+        AuthUserResponse: {
+            /** User Id */
+            user_id: string;
+            /** Username */
+            username: string;
+            /** Plan */
+            plan: string;
+            /** Created At */
+            created_at: string;
+            limits: components["schemas"]["PlanLimitsResponse"];
+            /** @description Present on /me; null on register/login. */
+            usage?: components["schemas"]["UsageResponse"] | null;
+        };
+        /**
          * BackendCapability
          * @description One entry of the platform backend capability matrix.
          */
@@ -617,6 +881,49 @@ export interface components {
             detail: string;
         };
         /**
+         * JobListItem
+         * @description One row of ``GET /v1/quantum/jobs`` — the caller's own jobs only.
+         */
+        JobListItem: {
+            /** Job Id */
+            job_id: string;
+            status: components["schemas"]["JobStatus"];
+            /** Created At */
+            created_at: string;
+            /** Completed At */
+            completed_at?: string | null;
+            /**
+             * Format
+             * @default
+             */
+            format: string;
+            /**
+             * Shots
+             * @default 0
+             */
+            shots: number;
+            /**
+             * Qubit Count
+             * @default 0
+             */
+            qubit_count: number;
+            /** Error Message */
+            error_message?: string | null;
+        };
+        /**
+         * JobListResponse
+         * @description ``GET /v1/quantum/jobs`` body — newest first, cursor-paginated.
+         */
+        JobListResponse: {
+            /** Jobs */
+            jobs: components["schemas"]["JobListItem"][];
+            /**
+             * Next Cursor
+             * @description Opaque base64 cursor for the next page; null when exhausted.
+             */
+            next_cursor?: string | null;
+        };
+        /**
          * JobResultPayload
          * @description The simulation result document retrieved from private object storage.
          *
@@ -769,6 +1076,56 @@ export interface components {
             error_message?: string | null;
         };
         /**
+         * LoginRequest
+         * @description ``POST /v1/auth/login`` body.
+         */
+        LoginRequest: {
+            /** Username */
+            username: string;
+            /** Password */
+            password: string;
+        };
+        /**
+         * PlanLimitsResponse
+         * @description The authenticated user's plan ceilings (mirrors ``api.plans.PlanLimit``).
+         */
+        PlanLimitsResponse: {
+            /** Name */
+            name: string;
+            /** Monthly Requests */
+            monthly_requests: number;
+            /** Monthly Compute Ms */
+            monthly_compute_ms: number;
+            /** Max Concurrent Jobs */
+            max_concurrent_jobs: number;
+            /** Max Qubits */
+            max_qubits: number;
+            /** Max Shots */
+            max_shots: number;
+            /** Requests Per Minute */
+            requests_per_minute: number;
+        };
+        /**
+         * RegisterRequest
+         * @description ``POST /v1/auth/register`` body — open registration, free plan.
+         * @example {
+         *       "password": "correct horse battery staple",
+         *       "username": "acme-labs"
+         *     }
+         */
+        RegisterRequest: {
+            /**
+             * Username
+             * @description Login handle: 3-32 chars, [a-z0-9_-], starts alphanumeric.
+             */
+            username: string;
+            /**
+             * Password
+             * @description Password, hashed with argon2id before storage.
+             */
+            password: string;
+        };
+        /**
          * SimulationAcceptedResponse
          * @description 202 Accepted body returned on successful enqueue.
          */
@@ -822,6 +1179,27 @@ export interface components {
              */
             idempotency_key?: string | null;
         };
+        /**
+         * UsageResponse
+         * @description Current-calendar-month counters for the authenticated user.
+         */
+        UsageResponse: {
+            /**
+             * Month
+             * @description UTC calendar month, YYYY-MM.
+             */
+            month: string;
+            /**
+             * Requests
+             * @description Simulation submissions + analyses this month.
+             */
+            requests: number;
+            /**
+             * Compute Ms
+             * @description Recorded worker compute time this month.
+             */
+            compute_ms: number;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -844,6 +1222,233 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    register_v1_auth_register_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Account created; session cookie set */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthUserResponse"];
+                };
+            };
+            /** @description Username already taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Global rate limit exceeded */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    login_v1_auth_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Session started; cookie set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthUserResponse"];
+                };
+            };
+            /** @description Invalid credentials (generic envelope) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Global rate limit exceeded */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    logout_v1_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session deleted; cookie cleared */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    me_v1_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthUserResponse"];
+                };
+            };
+        };
+    };
+    list_keys_v1_keys_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyListResponse"];
+                };
+            };
+        };
+    };
+    create_key_v1_keys_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApiKeyCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyCreatedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_key_v1_keys__key_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyRevokeResponse"];
+                };
+            };
+            /** @description Unknown key id (or not the caller's) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     healthz_healthz_get: {
         parameters: {
             query?: never;
@@ -888,6 +1493,20 @@ export interface operations {
                     "application/json": components["schemas"]["SimulationAcceptedResponse"];
                 };
             };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Plan limit exceeded (qubits/shots) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation firewall rejection */
             422: {
                 headers: {
@@ -895,7 +1514,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Rate limit exceeded */
+            /** @description Rate limit or quota exceeded */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -933,6 +1552,13 @@ export interface operations {
                     "application/json": components["schemas"]["CircuitAnalysisResponse"];
                 };
             };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation firewall rejection or unparseable circuit */
             422: {
                 headers: {
@@ -940,7 +1566,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Rate limit exceeded */
+            /** @description Rate limit or quota exceeded */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -969,7 +1595,14 @@ export interface operations {
                     "application/json": components["schemas"]["JobStatusResponse"];
                 };
             };
-            /** @description Unknown job id */
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown job id (or another tenant's) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1014,7 +1647,14 @@ export interface operations {
                     "application/json": components["schemas"]["JobResultResponse"];
                 };
             };
-            /** @description Unknown job id */
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown job id (or another tenant's) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1073,7 +1713,14 @@ export interface operations {
                     "application/json": components["schemas"]["JobCancelResponse"];
                 };
             };
-            /** @description Unknown job id */
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown job id (or another tenant's) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1105,6 +1752,60 @@ export interface operations {
             };
             /** @description Job store unavailable */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_jobs_v1_quantum_jobs_get: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["JobStatus"] | null;
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobListResponse"];
+                };
+            };
+            /** @description Malformed pagination cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Rate limit exceeded */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

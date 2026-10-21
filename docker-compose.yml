@@ -75,6 +75,10 @@ services:
       QUAC_RESULTS_BUCKET: quac-results
       QUAC_AWS_REGION: us-east-1
       QUAC_LOG_LEVEL: INFO
+      # Local-dev auth config: the API-key HMAC pepper (never a real secret
+      # outside compose) and plaintext cookies (dev serves over http).
+      QUAC_SECRET_KEY: local-dev-secret
+      QUAC_COOKIE_SECURE: "0"
       WEB_CONCURRENCY: "2"
     depends_on:
       localstack:

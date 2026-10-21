@@ -12,6 +12,9 @@ Public async surface:
 * :func:`update_job_status` — transition a job, optionally recording an error.
 * :func:`get_job_record` — fetch a job by ``job_id``.
 * :func:`cancel_job_record` — atomically cancel a non-terminal job.
+* :func:`list_jobs_by_owner` — owner-scoped job listing via the ``owner_id-index`` GSI.
+* :func:`count_active_jobs` — owner's queued+processing count (concurrency cap).
+* :func:`get_table` — the raw DynamoDB table handle (shared with :mod:`api.identity`).
 """
 
 from __future__ import annotations
@@ -145,6 +148,11 @@ class DynamoJobStore:
             # in application filtering alone.
             "owner_id": owner_id or DEFAULT_OWNER_ID,
             "schema_version": RECORD_SCHEMA_VERSION,
+            # Entity discriminator: the single table also holds identity items
+            # (USER#/KEY#/SESSION#/USAGE#/AUDIT# prefixes). ``entity="job"`` lets
+            # GSI job queries filter them out; legacy job rows written before
+            # this attribute existed are matched with attribute_not_exists.
+            "entity": "job",
         }
         try:
             table.put_item(
@@ -265,6 +273,96 @@ class DynamoJobStore:
             raise JobRecordNotFoundError(job_id)
         return dict(item)
 
+    def list_by_owner(
+        self,
+        owner_id: str,
+        *,
+        status: str | None = None,
+        limit: int = 20,
+        exclusive_start_key: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """List an owner's job records, newest first, via the GSI.
+
+        ``entity`` filtering keeps identity items (USER#/KEY#/…) that share the
+        owner out of the result while legacy job rows (written before the
+        discriminator existed) stay visible.
+
+        Returns ``(items, last_evaluated_key)`` — the raw key doubles as the
+        cursor for the next page.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        table = self._ensure_resource()
+        # NB: no ":owner" value here — boto3's Key() condition injects its own
+        # placeholder; supplying an unused key makes DynamoDB raise.
+        names: dict[str, str] = {"#e": "entity"}
+        values: dict[str, Any] = {":job": "job"}
+        condition = "(attribute_not_exists(#e) OR #e = :job)"
+        if status is not None:
+            names["#s"] = "status"
+            values[":status"] = status
+            condition += " AND #s = :status"
+
+        kwargs: dict[str, Any] = {
+            "IndexName": "owner_id-index",
+            "KeyConditionExpression": Key("owner_id").eq(owner_id),
+            "FilterExpression": condition,
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values,
+            "ScanIndexForward": False,  # newest first
+            "Limit": limit,
+        }
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+        try:
+            response = table.query(**kwargs)
+        except ClientError:
+            logger.error("DynamoDB owner query failed owner_id=%s", owner_id)
+            raise
+        items = [dict(item) for item in response.get("Items", [])]
+        return items, response.get("LastEvaluatedKey")
+
+    def count_active(self, owner_id: str) -> int:
+        """Count an owner's queued+processing jobs (concurrency admission).
+
+        The GSI is eventually consistent, so this count is a *soft* cap: a
+        submit racing a just-written record may overshoot by one. Documented
+        trade-off — correctness of the cap is not worth a strongly-consistent
+        scan of every job on the hot path.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        table = self._ensure_resource()
+        total = 0
+        kwargs: dict[str, Any] = {
+            "IndexName": "owner_id-index",
+            "KeyConditionExpression": Key("owner_id").eq(owner_id),
+            "FilterExpression": (
+                "(attribute_not_exists(#e) OR #e = :job) "
+                "AND (#s = :queued OR #s = :processing)"
+            ),
+            "ExpressionAttributeNames": {"#e": "entity", "#s": "status"},
+            "ExpressionAttributeValues": {
+                ":job": "job",
+                ":queued": JobStatus.QUEUED.value,
+                ":processing": JobStatus.PROCESSING.value,
+            },
+            "Select": "COUNT",
+        }
+        try:
+            while True:
+                response = table.query(**kwargs)
+                total += int(response.get("Count", 0))
+                last = response.get("LastEvaluatedKey")
+                if not last:
+                    break
+                kwargs["ExclusiveStartKey"] = last
+        except ClientError:
+            logger.error("DynamoDB active-count query failed owner_id=%s", owner_id)
+            raise
+        return total
+
 
 # --------------------------------------------------------------------------------------
 # Process-wide store instance
@@ -380,6 +478,40 @@ async def cancel_job_record(job_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(store.cancel, job_id)
 
 
+async def list_jobs_by_owner(
+    owner_id: str,
+    *,
+    status: str | None = None,
+    limit: int = 20,
+    exclusive_start_key: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """List an owner's jobs (newest first) off the event loop."""
+    store = _get_store()
+    return await asyncio.to_thread(
+        store.list_by_owner,
+        owner_id,
+        status=status,
+        limit=limit,
+        exclusive_start_key=exclusive_start_key,
+    )
+
+
+async def count_active_jobs(owner_id: str) -> int:
+    """Count an owner's queued+processing jobs off the event loop."""
+    store = _get_store()
+    return await asyncio.to_thread(store.count_active, owner_id)
+
+
+def get_table() -> Any:
+    """Expose the raw DynamoDB table handle for :mod:`api.identity`.
+
+    Identity items (users, keys, sessions, usage, audit) live in the same
+    single table as job records; :mod:`api.identity` shares this process-wide
+    handle instead of opening a second connection pool.
+    """
+    return _get_store()._ensure_resource()
+
+
 __all__ = [
     "DEFAULT_OWNER_ID",
     "RECORD_SCHEMA_VERSION",
@@ -388,9 +520,12 @@ __all__ = [
     "JobNotCancellableError",
     "JobRecordNotFoundError",
     "cancel_job_record",
+    "count_active_jobs",
     "create_job_record",
     "get_job_record",
+    "get_table",
     "initialise",
+    "list_jobs_by_owner",
     "shutdown",
     "update_job_status",
 ]

@@ -1,10 +1,13 @@
 /**
- * Application shell — brand header, left navigation, API status pill, theme
- * control, and the routed content outlet.
+ * Application shell — brand header, left navigation, session identity menu,
+ * API status pill, theme control, and the routed content outlet.
+ *
+ * Rendered inside `RequireAuth`, so `user` is always present here.
  */
 import { useQuery } from '@tanstack/react-query'
 import { NavLink, Outlet } from 'react-router-dom'
 import { getHealth } from '../api/client'
+import { useAuth } from '../lib/auth'
 import { useTheme } from '../lib/theme'
 import { Badge } from './ui'
 
@@ -71,6 +74,28 @@ function ThemeToggle() {
   )
 }
 
+/** Signed-in identity: username, plan tier, sign-out. */
+function UserMenu() {
+  const { user, logout } = useAuth()
+  if (!user) return null
+  return (
+    <span className="flex items-center gap-2">
+      <span className="hidden font-mono text-xs text-ink-muted sm:inline" title={user.user_id}>
+        {user.username}
+      </span>
+      <Badge tone={user.plan === 'free' ? 'neutral' : 'accent'}>{user.plan}</Badge>
+      <button
+        type="button"
+        onClick={() => void logout()}
+        className="rounded-lg border border-line bg-surface-2 px-2.5 py-1 text-xs text-ink-muted hover:border-line-strong hover:text-ink"
+        aria-label={`Sign out of ${user.username}`}
+      >
+        Sign out
+      </button>
+    </span>
+  )
+}
+
 export default function Shell() {
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
@@ -95,7 +120,7 @@ export default function Shell() {
           ))}
         </nav>
         <div className="border-t border-line px-3 py-3 text-[11px] text-ink-muted">
-          Local console · auth arrives with P1
+          Local console · session auth (HTTP-only cookie)
         </div>
       </aside>
 
@@ -118,6 +143,7 @@ export default function Shell() {
             ))}
           </nav>
           <div className="ml-auto flex items-center gap-2">
+            <UserMenu />
             <StatusPill />
             <ThemeToggle />
           </div>

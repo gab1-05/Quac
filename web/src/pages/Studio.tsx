@@ -4,10 +4,11 @@
  *
  * The stats strip comes from `POST /v1/quantum/analyze` (synchronous, zero
  * side effects) debounced while typing; "Run simulation" calls
- * `POST /v1/quantum/simulate` with a fresh idempotency key, records the job in
- * the browser-local history, and navigates to the job page for live tracking.
+ * `POST /v1/quantum/simulate` with a fresh idempotency key and navigates to
+ * the job page — the server-side job list (`GET /v1/quantum/jobs`) picks the
+ * submission up on its own.
  */
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -15,12 +16,10 @@ import {
   ApiError,
   submitSimulation,
   type CircuitFormat,
-  type JobStatus,
 } from '../api/client'
 import { Badge, Card, Disclosure, ErrorBanner, Skeleton, Stat } from '../components/ui'
 import { useDebouncedValue } from '../lib/hooks'
 import { formatBytes, formatInteger, formatSecondsBand, formatUsdBand } from '../lib/format'
-import { recordJob } from '../lib/history'
 
 const DEFAULT_QASM = `OPENQASM 3.0;
 include "stdgates.inc";
@@ -46,6 +45,7 @@ function warningTone(severity: 'info' | 'warning' | 'opportunity'): 'accent' | '
 
 export default function Studio() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [format, setFormat] = useState<CircuitFormat>('qasm3')
   const [circuitText, setCircuitText] = useState(DEFAULT_QASM)
   const [shots, setShots] = useState(1024)
@@ -91,13 +91,9 @@ export default function Studio() {
         idempotency_key: crypto.randomUUID(),
       }),
     onSuccess: (accepted) => {
-      recordJob({
-        job_id: accepted.job_id,
-        submitted_at: new Date().toISOString(),
-        format,
-        shots,
-        last_known_status: accepted.status as JobStatus,
-      })
+      // The server list is authoritative — refresh it so the new job is
+      // present the moment the visitor opens /jobs.
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
       navigate(`/jobs/${accepted.job_id}`)
     },
   })

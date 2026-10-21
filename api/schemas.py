@@ -350,6 +350,194 @@ class JobCancelResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# Authentication contracts (P1)
+# --------------------------------------------------------------------------------------
+
+USERNAME_PATTERN: Final[str] = r"^[a-z0-9][a-z0-9_-]{2,31}$"
+"""3-32 chars, lowercase alphanumeric plus _/-, must start alphanumeric."""
+
+MIN_PASSWORD_CHARS: Final[int] = 10
+MAX_PASSWORD_CHARS: Final[int] = 128
+
+
+class RegisterRequest(BaseModel):
+    """``POST /v1/auth/register`` body — open registration, free plan."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        json_schema_extra={
+            "example": {"username": "acme-labs", "password": "correct horse battery staple"}
+        },
+    )
+
+    username: str = Field(
+        ...,
+        min_length=3,
+        max_length=32,
+        pattern=USERNAME_PATTERN,
+        description="Login handle: 3-32 chars, [a-z0-9_-], starts alphanumeric.",
+    )
+    password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_CHARS,
+        max_length=MAX_PASSWORD_CHARS,
+        description="Password, hashed with argon2id before storage.",
+    )
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _lowercase_username(cls, value: Any) -> Any:
+        """Normalise to lowercase so ``Alice`` and ``alice`` cannot collide.
+
+        Runs *before* pattern validation, so ``Alice`` is legal input even
+        though only lowercase is storable.
+        """
+        return value.lower() if isinstance(value, str) else value
+
+
+class LoginRequest(BaseModel):
+    """``POST /v1/auth/login`` body."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=MAX_PASSWORD_CHARS)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _lowercase_username(cls, value: Any) -> Any:
+        """Match the registration normalisation."""
+        return value.lower() if isinstance(value, str) else value
+
+
+class PlanLimitsResponse(BaseModel):
+    """The authenticated user's plan ceilings (mirrors ``api.plans.PlanLimit``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    monthly_requests: int
+    monthly_compute_ms: int
+    max_concurrent_jobs: int
+    max_qubits: int
+    max_shots: int
+    requests_per_minute: int
+
+
+class UsageResponse(BaseModel):
+    """Current-calendar-month counters for the authenticated user."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    month: str = Field(..., description="UTC calendar month, YYYY-MM.")
+    requests: int = Field(..., description="Simulation submissions + analyses this month.")
+    compute_ms: int = Field(..., description="Recorded worker compute time this month.")
+
+
+class AuthUserResponse(BaseModel):
+    """Body returned by register/login/me."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str
+    username: str
+    plan: str
+    created_at: str
+    limits: PlanLimitsResponse
+    usage: UsageResponse | None = Field(
+        default=None, description="Present on /me; null on register/login."
+    )
+
+
+class ApiKeyCreateRequest(BaseModel):
+    """``POST /v1/keys`` body."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    label: str = Field(
+        default="default",
+        min_length=1,
+        max_length=64,
+        description="Human label shown in key listings (e.g. 'ci-runner').",
+    )
+
+
+class ApiKeyCreatedResponse(BaseModel):
+    """``POST /v1/keys`` response — ``key`` is shown exactly once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    key: str = Field(..., description="Full qk_… token. Store it now; it is never shown again.")
+    prefix: str = Field(..., description="Safe-to-display key prefix (qk_<key_id>).")
+    label: str
+    created_at: str
+
+
+class ApiKeySummary(BaseModel):
+    """One entry in ``GET /v1/keys`` (never includes the secret)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    prefix: str
+    label: str
+    created_at: str
+    revoked: bool
+
+
+class ApiKeyListResponse(BaseModel):
+    """``GET /v1/keys`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keys: list[ApiKeySummary]
+
+
+class ApiKeyRevokeResponse(BaseModel):
+    """``DELETE /v1/keys/{key_id}`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    revoked: bool = True
+    detail: str = "key revoked; requests using it now fail with 401"
+
+
+# --------------------------------------------------------------------------------------
+# Owner-scoped job listing (P1)
+# --------------------------------------------------------------------------------------
+
+
+class JobListItem(BaseModel):
+    """One row of ``GET /v1/quantum/jobs`` — the caller's own jobs only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: JobStatus
+    created_at: str
+    completed_at: str | None = None
+    format: str = ""
+    shots: int = 0
+    qubit_count: int = 0
+    error_message: str | None = None
+
+
+class JobListResponse(BaseModel):
+    """``GET /v1/quantum/jobs`` body — newest first, cursor-paginated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    jobs: list[JobListItem]
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque base64 cursor for the next page; null when exhausted.",
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Pre-flight analysis contracts (POST /v1/quantum/analyze)
 # --------------------------------------------------------------------------------------
 

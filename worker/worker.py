@@ -299,6 +299,45 @@ def _read_job_webhook_url(job_id: str) -> str | None:
     return str(webhook) if webhook else None
 
 
+def _record_usage(job_id: str, compute_ms: int) -> None:
+    """Attribute consumed compute time to the job owner's monthly counter.
+
+    Reads the job record for ``owner_id``, then ADDs ``compute_ms`` into the
+    owner's ``USAGE#<owner>#<YYYY-MM>`` row. Owners ``system`` (pre-auth legacy
+    rows) and missing owners are skipped — there is nobody to bill. Any error
+    is swallowed: usage accounting must never fail the SQS acknowledgement or
+    retry a completed job.
+    """
+    record = _read_job_record(job_id)
+    owner = str((record or {}).get("owner_id", "") or "")
+    if not owner or owner == "system":
+        return
+    month = datetime.now(UTC).strftime("%Y-%m")
+    try:
+        _get_dynamodb().Table(JOBS_TABLE).update_item(
+            Key={"job_id": f"USAGE#{owner}#{month}"},
+            UpdateExpression=(
+                "ADD compute_ms :ms "
+                "SET owner_id = if_not_exists(owner_id, :owner), "
+                "created_at = if_not_exists(created_at, :now), "
+                "#e = if_not_exists(#e, :entity), "
+                "#month = if_not_exists(#month, :month_value)"
+            ),
+            ExpressionAttributeNames={"#e": "entity", "#month": "month"},
+            ExpressionAttributeValues={
+                ":ms": int(compute_ms),
+                ":owner": owner,
+                ":now": datetime.now(UTC).isoformat(),
+                ":entity": "usage",
+                ":month_value": month,
+            },
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.warning(
+            "usage write failed job_id=%s owner=%s error=%s", job_id, owner, exc
+        )
+
+
 # --------------------------------------------------------------------------------------
 # S3 result storage
 # --------------------------------------------------------------------------------------
@@ -498,6 +537,7 @@ def _handle_business_failure(
     logger.error("job failed job_id=%s error=%s", job_id, exc)
     summary = f"{type(exc).__name__}: {exc}"
     trace_excerpt = trace[-ERROR_TRACE_MAX_CHARS:]
+    _record_usage(job_id, elapsed_ms)
 
     try:
         _update_job_status(
@@ -538,6 +578,7 @@ def _handle_timeout_failure(
 ) -> None:
     """Challenge #3 terminal path: dump ``Timeout Error`` and notify."""
     logger.error("timeout guard fired job_id=%s elapsed_ms=%d", job_id, elapsed_ms)
+    _record_usage(job_id, elapsed_ms)
     try:
         _update_job_status(
             job_id,
@@ -762,8 +803,10 @@ def _process_record(record: dict[str, Any], context: Any) -> None:
     except JobCancelledError:
         # Cancelled while finalising: the artifact must not outlive the job.
         _delete_result_object(key)
+        _record_usage(job_id, simulation_time_ms)
         raise
 
+    _record_usage(job_id, simulation_time_ms)
     logger.info("job completed job_id=%s time_ms=%d key=%s", job_id, simulation_time_ms, key)
 
     if webhook_url:
